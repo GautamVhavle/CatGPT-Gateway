@@ -35,7 +35,7 @@ from langchain_core.tools import tool
 
 BASE_URL = "http://localhost:8000/v1"
 MODEL = "catgpt-browser"
-API_KEY = "not-needed"  # CatGPT doesn't require auth
+API_KEY = "dummy123"  # CatGPT doesn't require auth
 
 # Image test assets
 IMAGE_DIR = Path(__file__).resolve().parent.parent / "downloads" / "images"

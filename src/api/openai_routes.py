@@ -27,6 +27,9 @@ from src.api.openai_schemas import (
     Choice,
     ChoiceMessage,
     FunctionCallInfo,
+    ImageData,
+    ImageGenerationRequest,
+    ImagesResponse,
     ModelListResponse,
     ModelObject,
     ToolCall,
@@ -395,6 +398,117 @@ async def list_models() -> ModelListResponse:
             ModelObject(id=MODEL_ID, owned_by="catgpt"),
         ]
     )
+
+
+@openai_router.post("/v1/images/generations", response_model=ImagesResponse)
+async def create_image(
+    request: ImageGenerationRequest,
+) -> ImagesResponse:
+    """
+    OpenAI-compatible image generation endpoint.
+
+    Sends the prompt to ChatGPT which uses DALL-E to generate images.
+    Downloads the generated images and returns them in OpenAI format.
+    Supports response_format='b64_json' (default) or 'url' (local file path).
+    """
+    import base64
+
+    if not request.prompt:
+        raise HTTPException(status_code=400, detail="prompt cannot be empty")
+
+    client = _get_client()
+
+    async with _lock:
+        start_time = time.time()
+
+        # Build an image-generation prompt.
+        # n > 1: we ask ChatGPT to generate multiple images
+        # size/quality/style hints are included but ChatGPT web may ignore them.
+        prompt_parts = [f"Generate an image: {request.prompt}"]
+        if request.n and request.n > 1:
+            prompt_parts.append(f"Please generate {request.n} different images.")
+        if request.size and request.size != "1024x1024":
+            prompt_parts.append(f"Image size: {request.size}.")
+        if request.quality == "hd":
+            prompt_parts.append("Make it high-definition / highly detailed.")
+        if request.style == "natural":
+            prompt_parts.append("Use a natural, realistic style.")
+
+        full_prompt = " ".join(prompt_parts)
+
+        log.info(
+            f"POST /v1/images/generations — prompt='{request.prompt[:80]}', "
+            f"n={request.n}, size={request.size}, response_format={request.response_format}"
+        )
+
+        # Send to ChatGPT
+        try:
+            result = await client.send_message(full_prompt)
+        except Exception as e:
+            log.error(f"ChatGPT error during image generation: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"ChatGPT error: {str(e)}")
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # Check if ChatGPT generated images
+        if not result.images:
+            # ChatGPT may have responded with text instead of generating an image.
+            # This can happen when the model declines or gives a text description.
+            log.warning(
+                f"No images detected in response ({elapsed_ms}ms). "
+                f"ChatGPT replied: {result.message[:200]}"
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"ChatGPT did not generate an image. "
+                    f"Model response: {result.message[:500]}"
+                ),
+            )
+
+        # Build image data objects
+        image_data_list: list[ImageData] = []
+        for img_info in result.images:
+            revised_prompt = img_info.prompt_title or img_info.alt or request.prompt
+
+            if request.response_format == "b64_json":
+                # Read the downloaded file and base64-encode it
+                if img_info.local_path:
+                    try:
+                        with open(img_info.local_path, "rb") as f:
+                            img_bytes = f.read()
+                        b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        image_data_list.append(
+                            ImageData(
+                                b64_json=b64,
+                                revised_prompt=revised_prompt,
+                            )
+                        )
+                    except Exception as e:
+                        log.error(f"Failed to read image file {img_info.local_path}: {e}")
+                else:
+                    log.warning(f"Image has no local_path: {img_info.url[:80]}")
+            else:
+                # response_format == "url" → return local file path as URL
+                image_data_list.append(
+                    ImageData(
+                        url=img_info.local_path or img_info.url,
+                        revised_prompt=revised_prompt,
+                    )
+                )
+
+        if not image_data_list:
+            raise HTTPException(
+                status_code=500,
+                detail="Images were detected but could not be processed.",
+            )
+
+        log.info(
+            f"Image generation complete: {len(image_data_list)} image(s), "
+            f"{elapsed_ms}ms, format={request.response_format}"
+        )
+
+        return ImagesResponse(data=image_data_list)
 
 
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)

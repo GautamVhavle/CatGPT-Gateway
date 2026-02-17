@@ -28,6 +28,7 @@
    - [Image Input (Vision)](#image-input-vision)
    - [File Attachments (PDF, DOCX, etc.)](#file-attachments-pdf-docx-etc)
    - [Combined: Images + Files + Tools](#combined-images--files--tools)
+   - [Image Generation (DALL-E)](#image-generation-dall-e)
 9. [Custom REST API](#custom-rest-api)
 10. [TUI — Interactive Terminal Client](#tui--interactive-terminal-client)
 11. [DALL-E Image Generation](#dall-e-image-generation)
@@ -320,13 +321,14 @@ environment:
 
 ## OpenAI-Compatible API
 
-CatGPT exposes an OpenAI-compatible API at `/v1/chat/completions`. This means **any OpenAI SDK or LangChain client works out of the box** — just point it to `http://localhost:8000/v1`.
+CatGPT exposes an OpenAI-compatible API at `/v1/chat/completions` and `/v1/images/generations`. This means **any OpenAI SDK or LangChain client works out of the box** — just point it to `http://localhost:8000/v1`.
 
 ### Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | Chat completions (with tools, images, files) |
+| `POST` | `/v1/images/generations` | Generate images via DALL-E |
 | `GET` | `/v1/models` | List available models |
 
 **Model ID:** `catgpt-browser`\
@@ -559,6 +561,75 @@ response = client.chat.completions.create(
     }]
 )
 ```
+
+### Image Generation (DALL-E)
+
+Generate images using the OpenAI-compatible `POST /v1/images/generations` endpoint:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy123")
+
+response = client.images.generate(
+    model="dall-e-3",
+    prompt="A cyberpunk cat hacking a mainframe",
+    n=1,
+    size="1024x1024",
+    response_format="b64_json",
+)
+
+# Access the generated image
+image_data = response.data[0]
+print(f"Revised prompt: {image_data.revised_prompt}")
+
+# Save the image
+import base64
+with open("generated_image.png", "wb") as f:
+    f.write(base64.b64decode(image_data.b64_json))
+```
+
+```bash
+# Or with curl:
+curl -X POST http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy123" \
+  -d '{
+    "model": "dall-e-3",
+    "prompt": "A cyberpunk cat hacking a mainframe",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
+
+**Request parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | *(required)* | Text description of the image to generate |
+| `model` | string | `dall-e-3` | Model name (ignored — uses ChatGPT's DALL-E) |
+| `n` | integer | `1` | Number of images (1–4) |
+| `size` | string | `1024x1024` | Requested size (hint to ChatGPT) |
+| `quality` | string | `standard` | `standard` or `hd` |
+| `style` | string | `vivid` | `vivid` or `natural` |
+| `response_format` | string | `b64_json` | `b64_json` (base64 image) or `url` (local file path) |
+
+**Response format:**
+```json
+{
+  "created": 1700000000,
+  "data": [
+    {
+      "b64_json": "<base64-encoded-image>",
+      "revised_prompt": "A description of what was generated"
+    }
+  ]
+}
+```
+
+> **Note:** The `size`, `quality`, and `style` parameters are passed as hints in the prompt to ChatGPT.
+> The actual image size depends on what DALL-E generates through the web UI.
 
 ---
 
@@ -859,15 +930,22 @@ All settings loaded from environment variables (`.env` file) with sensible defau
 
 ## Testing
 
-The test suite is in `scripts/test_langchain_tools.py` with 6 test categories:
+The test suite is in `scripts/test_langchain_tools.py` (chat, tools, images, files) and `scripts/test_image_generation.py` (image generation endpoint):
 
 ```bash
 # Activate venv (local) or run against Docker API
 source .venv/bin/activate
+
+# Chat / tools / vision / file tests
 python scripts/test_langchain_tools.py
+
+# Image generation tests
+python scripts/test_image_generation.py
 ```
 
 ### Test Categories
+
+#### Chat & Tools (`test_langchain_tools.py`)
 
 | # | Test | What It Validates |
 |---|------|-------------------|
@@ -877,6 +955,15 @@ python scripts/test_langchain_tools.py
 | 4 | **Complex Multi-Tool** | Two tools called in one turn (weather + math, reverse + wikipedia) |
 | 5 | **Image Input** | Single image, multiple images, image + tool calling |
 | 6 | **File Attachment** | PDF upload + summarize, PDF + image combined |
+
+#### Image Generation (`test_image_generation.py`)
+
+| # | Test | What It Validates |
+|---|------|-------------------|
+| 1 | **Basic b64_json** | Generate image, validate base64 response, save to disk |
+| 2 | **Generate & Save** | HD quality image, verify file exists and has content |
+| 3 | **URL format** | `response_format="url"` returns local file path |
+| 4 | **OpenAI SDK** | `client.images.generate()` works end-to-end |
 
 ### Test Assets
 

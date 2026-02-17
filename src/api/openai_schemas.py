@@ -134,3 +134,31 @@ class ModelListResponse(BaseModel):
     """Response for GET /v1/models."""
     object: str = "list"
     data: list[ModelObject]
+
+
+# ── Image Generation ────────────────────────────────────────────
+
+
+class ImageGenerationRequest(BaseModel):
+    """OpenAI-compatible image generation request (POST /v1/images/generations)."""
+    prompt: str
+    model: Optional[str] = "dall-e-3"
+    n: Optional[int] = Field(default=1, ge=1, le=4)
+    size: Optional[str] = "1024x1024"
+    quality: Optional[str] = "standard"
+    style: Optional[str] = "vivid"
+    response_format: Optional[str] = "b64_json"  # "url" or "b64_json"
+    user: Optional[str] = None
+
+
+class ImageData(BaseModel):
+    """A single generated image in the response."""
+    url: Optional[str] = None
+    b64_json: Optional[str] = None
+    revised_prompt: Optional[str] = None
+
+
+class ImagesResponse(BaseModel):
+    """OpenAI-compatible image generation response."""
+    created: int = Field(default_factory=lambda: int(time.time()))
+    data: List[ImageData]
