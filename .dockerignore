@@ -1,0 +1,42 @@
+# Don't send these to Docker build context
+.venv/
+venv/
+env/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+
+# Browser data (will be mounted as volume)
+browser_data/
+chrome-profile/
+
+# Logs (will be mounted as volume)
+logs/
+docker-logs/
+
+# Downloads
+downloads/
+
+# Environment (baked into image or set via compose)
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker compose (not needed inside image, but docker/ dir IS needed)
+Dockerfile
+docker-compose.yml
+
+# Docs
+*.md
+LICENSE
+
+# Tests (not needed in production image)
+tests/

@@ -1,0 +1,348 @@
+/* ════════════════════════════════════════════════════════════════
+   CATGPT — GitHub Dark Theme
+   Palette:
+     bg-canvas    #0d1117    (main background)
+     bg-overlay   #161b22    (panels, cards, header)
+     bg-subtle    #1c2128    (hover / secondary surfaces)
+     bg-inset     #010409    (inset areas)
+     border-default  #30363d
+     border-muted    #21262d
+     fg-default   #e6edf3    (primary text)
+     fg-muted     #8b949e    (secondary text)
+     fg-subtle    #6e7681    (tertiary text)
+     accent-blue  #58a6ff    (links, primary accent)
+     accent-green #3fb950    (success, connected)
+     accent-red   #f85149    (errors)
+     accent-orange #d29922   (warnings)
+     accent-purple #bc8cff   (images, special)
+     accent-pink  #f778ba    (decorative)
+   ════════════════════════════════════════════════════════════════ */
+
+
+/* ── Global ─────────────────────────────────────────────────── */
+
+Screen {
+    background: #0d1117;
+}
+
+* {
+    scrollbar-background: #161b22;
+    scrollbar-color: #30363d;
+    scrollbar-color-hover: #58a6ff;
+    scrollbar-color-active: #58a6ff;
+    scrollbar-size-vertical: 1;
+}
+
+
+/* ── Splash Screen ──────────────────────────────────────────── */
+
+SplashScreen {
+    align: center middle;
+    background: #0d1117;
+}
+
+#splash-container {
+    width: auto;
+    height: auto;
+    align: center middle;
+    content-align: center middle;
+    padding: 1 4;
+}
+
+#splash-cat {
+    text-align: center;
+    color: #58a6ff;
+    width: auto;
+    height: auto;
+    content-align: center middle;
+}
+
+#splash-logo {
+    text-align: center;
+    color: #e6edf3;
+    text-style: bold;
+    width: auto;
+    height: auto;
+    margin-top: 1;
+}
+
+#splash-tagline {
+    text-align: center;
+    color: #8b949e;
+    margin-top: 1;
+    width: 100%;
+}
+
+#splash-version {
+    text-align: center;
+    color: #6e7681;
+    text-style: italic;
+    margin-top: 0;
+    width: 100%;
+}
+
+#splash-hint {
+    text-align: center;
+    color: #30363d;
+    margin-top: 2;
+    width: 100%;
+}
+
+
+/* ── Chat Screen Layout ─────────────────────────────────────── */
+
+ChatScreen {
+    layout: vertical;
+    background: #0d1117;
+}
+
+#status-bar {
+    dock: top;
+    width: 100%;
+    height: 1;
+    background: #161b22;
+    color: #8b949e;
+    padding: 0 2;
+    margin: 0 0;
+}
+
+#chat-container {
+    width: 100%;
+    height: 1fr;
+    border: round #30363d;
+    border-title-color: #58a6ff;
+    border-title-style: bold;
+    background: #0d1117;
+    margin: 0 1;
+}
+
+#chat-log {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
+    background: #0d1117;
+}
+
+
+/* ── Input ──────────────────────────────────────────────────── */
+
+#chat-input {
+    width: 100%;
+    height: 3;
+    border: round #30363d;
+    background: #0d1117;
+    color: #e6edf3;
+    padding: 0 1;
+    margin: 0 1 0 1;
+}
+
+#chat-input:focus {
+    border: round #58a6ff;
+    background: #0d1117;
+}
+
+#chat-input > .input--cursor {
+    background: #e6edf3;
+    color: #0d1117;
+}
+
+#chat-input > .input--placeholder {
+    color: #484f58;
+    text-style: italic;
+}
+
+#chat-input > .input--selection {
+    background: #264f78;
+}
+
+
+/* ── User Messages ──────────────────────────────────────────── */
+
+.user-msg {
+    margin: 1 0 0 0;
+    padding: 1 2;
+    background: #161b22;
+    border-left: thick #58a6ff;
+    width: 100%;
+    height: auto;
+}
+
+.user-msg-header {
+    color: #58a6ff;
+    text-style: bold;
+    width: 100%;
+    height: 1;
+}
+
+.user-msg-body {
+    color: #e6edf3;
+    width: 100%;
+    height: auto;
+    margin-top: 0;
+}
+
+
+/* ── Assistant Messages ─────────────────────────────────────── */
+
+.assistant-msg {
+    margin: 1 0 0 0;
+    padding: 1 2;
+    background: #161b22;
+    border-left: thick #3fb950;
+    width: 100%;
+    height: auto;
+}
+
+.assistant-msg-header {
+    color: #3fb950;
+    text-style: bold;
+    width: 100%;
+    height: 1;
+}
+
+.assistant-msg-body {
+    color: #e6edf3;
+    width: 100%;
+    height: auto;
+    margin-top: 0;
+}
+
+.assistant-msg-footer {
+    color: #6e7681;
+    text-style: italic;
+    text-align: right;
+    width: 100%;
+    height: 1;
+    margin-top: 0;
+}
+
+
+/* ── Image Cards ────────────────────────────────────────────── */
+
+.image-card {
+    margin: 1 0 0 0;
+    padding: 1 2;
+    background: #161b22;
+    border-left: thick #bc8cff;
+    width: 100%;
+    height: auto;
+}
+
+.image-card-header {
+    color: #bc8cff;
+    text-style: bold;
+    width: 100%;
+    height: 1;
+}
+
+.image-card-body {
+    color: #e6edf3;
+    width: 100%;
+    height: auto;
+    margin-top: 0;
+}
+
+
+/* ── System Messages ────────────────────────────────────────── */
+
+.system-msg {
+    text-align: center;
+    color: #8b949e;
+    text-style: italic;
+    margin: 1 0;
+    padding: 0 2;
+    width: 100%;
+    height: auto;
+}
+
+.system-success {
+    text-align: center;
+    color: #3fb950;
+    margin: 1 0;
+    padding: 0 2;
+    width: 100%;
+    height: auto;
+}
+
+.system-error {
+    text-align: center;
+    color: #f85149;
+    text-style: bold;
+    margin: 1 0;
+    padding: 0 2;
+    width: 100%;
+    height: auto;
+}
+
+.system-info-block {
+    margin: 1 0;
+    padding: 1 2;
+    background: #161b22;
+    border: round #30363d;
+    width: 100%;
+    height: auto;
+    color: #e6edf3;
+}
+
+
+/* ── Thinking Indicator ─────────────────────────────────────── */
+
+.thinking {
+    text-align: center;
+    color: #58a6ff;
+    text-style: bold italic;
+    margin: 1 0;
+    padding: 0 2;
+    width: 100%;
+    height: auto;
+}
+
+
+/* ── Welcome Card (shown on connect) ────────────────────────── */
+
+.welcome-card {
+    margin: 2 4;
+    padding: 2 4;
+    background: #161b22;
+    border: round #30363d;
+    width: 100%;
+    height: auto;
+    color: #e6edf3;
+    content-align: center middle;
+    text-align: center;
+}
+
+
+/* ── Header / Footer ────────────────────────────────────────── */
+
+Header {
+    background: #161b22;
+    color: #e6edf3;
+    dock: top;
+    height: 1;
+}
+
+Header .header--highlight {
+    color: #58a6ff;
+    text-style: bold;
+}
+
+Footer {
+    background: #161b22;
+    color: #6e7681;
+}
+
+FooterKey {
+    background: #161b22;
+    color: #8b949e;
+}
+
+FooterKey:hover {
+    background: #1c2128;
+    color: #58a6ff;
+}
+
+FooterKey > .footer-key--key {
+    background: #21262d;
+    color: #58a6ff;
+}

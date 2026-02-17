@@ -1,0 +1,81 @@
+# ── CatGPT Gateway — Docker Compose ─────────────────────────────
+# Runs the full application with headed Chrome inside Docker.
+# Uses Xvfb (virtual display) + noVNC (browser-based VNC) for login.
+#
+# Usage:
+#   docker compose up --build       # First time (builds image)
+#   docker compose up               # Subsequent runs
+#   docker compose logs -f catgpt   # Watch logs
+#   docker compose down             # Stop everything
+#
+# Ports:
+#   http://localhost:8000  — FastAPI API (OpenAI-compatible)
+#   http://localhost:6080  — noVNC web UI (for login / debugging)
+
+services:
+  catgpt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: catgpt
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"   # FastAPI API
+      - "6080:6080"   # noVNC web UI
+
+    volumes:
+      # Persistent browser session — survives container restarts
+      - catgpt_browser_data:/app/browser_data
+      # Logs accessible from host
+      - ./docker-logs:/app/logs
+
+    environment:
+      # Browser (headed on virtual display)
+      - HEADLESS=false
+      - SLOW_MO=50
+      - DISPLAY=:99
+      - DISPLAY_WIDTH=1280
+      - DISPLAY_HEIGHT=720
+      - DISPLAY_DEPTH=24
+
+      # ChatGPT
+      - CHATGPT_URL=https://chatgpt.com
+
+      # Timeouts
+      - RESPONSE_TIMEOUT=120000
+      - SELECTOR_TIMEOUT=10000
+
+      # Human simulation
+      - TYPING_SPEED_MIN=50
+      - TYPING_SPEED_MAX=150
+      - THINKING_PAUSE_MIN=1000
+      - THINKING_PAUSE_MAX=3000
+
+      # API
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_TOKEN=dummy123
+
+      # VNC Authentication
+      - VNC_PASSWORD=catgpt
+
+      # Logging (verbose for Docker)
+      - LOG_LEVEL=DEBUG
+      - VERBOSE=true
+
+    # Chromium needs these for sandbox
+    security_opt:
+      - seccomp=unconfined
+    shm_size: "2gb"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  catgpt_browser_data:
+    driver: local

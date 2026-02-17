@@ -1,0 +1,21 @@
+# Core
+patchright>=1.58
+playwright-stealth>=2.0.2
+
+# TUI (Phase 2)
+textual>=0.85
+typer>=0.12
+rich>=13.0
+
+# API (Phase 3)
+fastapi>=0.115
+uvicorn>=0.32
+
+# Data & Config
+pydantic>=2.5
+python-dotenv>=1.0
+
+# OpenAI-compatible testing
+openai>=1.0
+langchain-openai>=0.1
+langchain>=0.2
