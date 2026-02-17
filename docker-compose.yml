@@ -35,8 +35,8 @@ services:
       - HEADLESS=false
       - SLOW_MO=50
       - DISPLAY=:99
-      - DISPLAY_WIDTH=1280
-      - DISPLAY_HEIGHT=720
+      - DISPLAY_WIDTH=1366
+      - DISPLAY_HEIGHT=768
       - DISPLAY_DEPTH=24
 
       # ChatGPT
