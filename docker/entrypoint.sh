@@ -113,3 +113,5 @@ echo ""
 # ── 8. Start supervisor (manages all processes) ────────────────
 echo "[entrypoint] Starting supervisor..."
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/catgpt.conf
+
+# tested by Gautam and Harry on 18th February uWu 
