@@ -242,6 +242,58 @@ python -m src.api.server
 python -m src.cli.app
 ```
 
+### Nix Flake (Reproducible)
+
+This repo ships a `flake.nix` that packages Patchright and matching Chromium revisions.
+
+```bash
+# 1. Optional: copy env template for local overrides
+cp .env.example .env
+
+# 2. First login (one-time, interactive)
+nix run .#login
+
+# 3. Start the proxy
+nix run .#proxy
+
+# 4. Optional: run the TUI
+nix run .#tui
+```
+
+Notes:
+- The app reads `./.env` from your current working directory if present.
+- Environment variables from your shell/systemd override values from `.env`.
+
+#### systemd user service (optional)
+
+```ini
+# ~/.config/systemd/user/catgpt.service
+[Unit]
+Description=CatGPT Proxy (Nix flake)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/CatGPT-Gateway
+ExecStart=/usr/bin/env nix run .#proxy
+Restart=on-failure
+RestartSec=5
+Environment=HEADLESS=true
+Environment=API_TOKEN=change-me
+Environment=API_HOST=127.0.0.1
+Environment=API_PORT=8000
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now catgpt
+journalctl --user -u catgpt -f
+```
+
 ---
 
 ## First Login (One-Time Setup)

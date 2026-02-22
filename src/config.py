@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from project root
+# Load .env from current working directory first (if present),
+# then fall back to the project root .env.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(Path.cwd() / ".env")
 load_dotenv(_PROJECT_ROOT / ".env")
 
 
