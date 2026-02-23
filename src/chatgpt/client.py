@@ -20,6 +20,8 @@ from src.chatgpt.detector import (
     wait_for_response_complete,
     extract_last_response_via_copy,
     count_assistant_messages,
+    get_latest_assistant_turn_signature,
+    is_incomplete_response_text,
 )
 from src.chatgpt.image_handler import extract_images_from_response
 from src.chatgpt.models import ChatResponse
@@ -70,7 +72,9 @@ class ChatGPTClient:
 
         # 0. Count existing assistant messages so we know when a new one appears
         pre_count = await count_assistant_messages(self._page)
+        pre_turn_signature = await get_latest_assistant_turn_signature(self._page)
         log.debug(f"Assistant messages before send: {pre_count}")
+        log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
         # 1. Brief pause (human would take a moment to start typing)
         await random_delay(500, 1200)
@@ -101,7 +105,9 @@ class ChatGPTClient:
         log.info("Waiting for ChatGPT response...")
         expected_count = pre_count + 1
         completed = await wait_for_response_complete(
-            self._page, expected_msg_count=expected_count
+            self._page,
+            expected_msg_count=expected_count,
+            previous_turn_signature=pre_turn_signature,
         )
 
         if not completed:
@@ -120,13 +126,41 @@ class ChatGPTClient:
         if has_images:
             # Image responses don't have a copy button — extract text
             # from the turn's DOM instead (will get the image title/desc)
-            response_text = await self._extract_image_turn_text()
+            response_text = await self._extract_image_turn_text(pre_turn_signature)
             log.info(f"Response contains {len(images)} generated image(s)")
             for img in images:
                 log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
         else:
             # Standard text response — use copy button (most reliable)
-            response_text = await extract_last_response_via_copy(self._page)
+            response_text = await extract_last_response_via_copy(
+                self._page,
+                previous_turn_signature=pre_turn_signature,
+            )
+
+            # If we only captured a transient status (e.g. "Pro thinking"),
+            # keep waiting and retry extraction on the same new turn.
+            if is_incomplete_response_text(response_text):
+                log.warning("Extracted text looks incomplete/transient; retrying for final answer")
+                for attempt in range(1, 3):
+                    await asyncio.sleep(4)
+                    await wait_for_response_complete(
+                        self._page,
+                        timeout_ms=90000,
+                        previous_turn_signature=pre_turn_signature,
+                    )
+                    retry_text = await extract_last_response_via_copy(
+                        self._page,
+                        previous_turn_signature=pre_turn_signature,
+                    )
+
+                    if retry_text and not is_incomplete_response_text(retry_text):
+                        response_text = retry_text
+                        log.info(f"Recovered final response text on retry {attempt}")
+                        break
+
+                    if retry_text:
+                        response_text = retry_text
+                    log.warning(f"Retry {attempt} still incomplete/transient")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
@@ -210,7 +244,7 @@ class ChatGPTClient:
 
     # ── Private Helpers ─────────────────────────────────────────
 
-    async def _extract_image_turn_text(self) -> str:
+    async def _extract_image_turn_text(self, previous_turn_signature: str | None = None) -> str:
         """
         Extract any text content from the latest turn (for image responses).
 
@@ -218,10 +252,37 @@ class ChatGPTClient:
         "Creating image • Adorable orange tabby kitten close-up"
         """
         text = await self._page.evaluate("""
-            () => {
+            (previousSignature) => {
                 const articles = document.querySelectorAll('article');
                 if (articles.length === 0) return '';
-                const last = articles[articles.length - 1];
+
+                const isAssistantArticle = (article) => {
+                    const hasAssistantRole = article.querySelector('[data-message-author-role="assistant"]');
+                    const hasAgentTurn = article.querySelector('.agent-turn');
+                    const hasGeneratedImage = article.querySelector('img[alt="Generated image"], div[id^="image-"]');
+                    return Boolean(hasAssistantRole || hasAgentTurn || hasGeneratedImage);
+                };
+
+                let last = null;
+                for (let idx = articles.length - 1; idx >= 0; idx--) {
+                    const article = articles[idx];
+                    if (!isAssistantArticle(article)) continue;
+
+                    const stableId =
+                        article.getAttribute('data-message-id') ||
+                        article.getAttribute('data-testid') ||
+                        article.id ||
+                        '';
+                    const signature = `${idx}:${stableId}`;
+                    if (previousSignature && signature === previousSignature) {
+                        return '';
+                    }
+
+                    last = article;
+                    break;
+                }
+
+                if (!last) return '';
 
                 // Try to get descriptive text (not "ChatGPT said:" heading)
                 const spans = last.querySelectorAll('span');
@@ -238,9 +299,9 @@ class ChatGPTClient:
                 // Fallback: full turn inner text
                 const full = (last.innerText || '').trim();
                 // Strip the "ChatGPT said:" prefix
-                return full.replace(/^ChatGPT said:\s*/i, '').trim();
+                return full.replace(/^ChatGPT said:\\s*/i, '').trim();
             }
-        """)
+        """, previous_turn_signature)
         return text or ""
 
     async def _find_selector(self, selectors: list[str], name: str) -> str | None:
