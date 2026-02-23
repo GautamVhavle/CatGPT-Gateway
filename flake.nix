@@ -248,6 +248,11 @@
               pkgs.nodejs
             ];
             text = ''
+              runtime_root="$PWD"
+              if [ ! -d "$runtime_root/src" ] || [ ! -d "$runtime_root/scripts" ]; then
+                runtime_root="${src}"
+              fi
+
               export PLAYWRIGHT_BROWSERS_PATH="${patchrightBrowsers}"
               export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
               export PLAYWRIGHT_SKIP_BROWSER_GC=1
@@ -256,19 +261,20 @@
 
               state_home="''${XDG_STATE_HOME:-$HOME/.local/state}"
 
-              if [ ! -f .env ]; then
+              if [ "$runtime_root" = "${src}" ] && [ ! -f "$runtime_root/.env" ]; then
                 export BROWSER_DATA_DIR="''${BROWSER_DATA_DIR:-$state_home/catgpt/browser_data}"
                 export LOG_DIR="''${LOG_DIR:-$state_home/catgpt/logs}"
                 export IMAGES_DIR="''${IMAGES_DIR:-$state_home/catgpt/downloads/images}"
               fi
 
-              mkdir -p "''${BROWSER_DATA_DIR:-$state_home/catgpt/browser_data}" \
-                       "''${LOG_DIR:-$state_home/catgpt/logs}" \
-                       "''${IMAGES_DIR:-$state_home/catgpt/downloads/images}"
+              mkdir -p "''${BROWSER_DATA_DIR:-$runtime_root/browser_data}" \
+                       "''${LOG_DIR:-$runtime_root/logs}" \
+                       "''${IMAGES_DIR:-$runtime_root/downloads/images}"
 
-               export PYTHONPATH="${src}:''${PYTHONPATH:-}"
+              export PYTHONPATH="$runtime_root:${src}:''${PYTHONPATH:-}"
 
-               exec python ${command}
+              cd "$runtime_root"
+              exec python ${command}
             '';
           };
 
@@ -279,7 +285,7 @@
 
         loginScript = mkCatgptScript {
           name = "catgpt-login";
-          command = "${src}/scripts/first_login.py";
+          command = "scripts/first_login.py";
         };
 
         tuiScript = mkCatgptScript {
