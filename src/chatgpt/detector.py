@@ -24,7 +24,7 @@ log = setup_logging("detector")
 def normalize_assistant_text(text: str | None) -> str:
     """Normalize extracted assistant text for validation and comparisons."""
     cleaned = (text or "").strip()
-    cleaned = re.sub(r"^ChatGPT said:\\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^ChatGPT said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned
 
 
