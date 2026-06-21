@@ -15,17 +15,13 @@ This module:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 import time
-from pathlib import Path
-from urllib.parse import urlparse
 
 from patchright.async_api import Page
 
 from src.config import Config
-from src.selectors import Selectors
 from src.chatgpt.models import ImageInfo
 from src.log import setup_logging
 

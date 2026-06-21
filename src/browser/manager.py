@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import random
-import signal
 import socket
 from pathlib import Path
 from patchright.async_api import async_playwright, BrowserContext, Page, Playwright

@@ -16,12 +16,21 @@ class ImageInfo(BaseModel):
     prompt_title: str = Field(default="", description="Image generation title shown by ChatGPT")
 
 
+class AudioInfo(BaseModel):
+    """Metadata for a generated read-aloud audio file."""
+    url: str = Field(default="", description="Original audio URL captured from the browser")
+    local_path: str = Field(default="", description="Local file path after download")
+    mime_type: str = Field(default="", description="Audio MIME type")
+    size_bytes: int = Field(default=0, description="Downloaded audio size in bytes")
+
+
 class Message(BaseModel):
     """A single message in a conversation."""
     role: str = Field(description="'user' or 'assistant'")
     content: str = Field(description="Message text content")
     timestamp: datetime = Field(default_factory=datetime.now)
     images: list[ImageInfo] = Field(default_factory=list, description="Images in this message")
+    audio: AudioInfo | None = Field(default=None, description="Read-aloud audio for this message")
 
 
 class ChatResponse(BaseModel):
@@ -31,6 +40,8 @@ class ChatResponse(BaseModel):
     response_time_ms: int = Field(default=0, description="Time taken for response in ms")
     images: list[ImageInfo] = Field(default_factory=list, description="Generated images")
     has_images: bool = Field(default=False, description="Whether the response contains images")
+    audio: AudioInfo | None = Field(default=None, description="Read-aloud audio for the response")
+    has_audio: bool = Field(default=False, description="Whether read-aloud audio was generated")
 
 
 class Thread(BaseModel):

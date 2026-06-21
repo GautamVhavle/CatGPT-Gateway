@@ -141,7 +141,7 @@ async def main():
             print(f"\n  {'─' * 60}")
             print(f"  Test {i}/{len(TESTS)}: {test['name']}")
             print(f"  Prompt: {test['prompt'][:70]}...")
-            print(f"  ⏳ Sending...")
+            print("  ⏳ Sending...")
 
             try:
                 response = await client.send_message(test["prompt"])

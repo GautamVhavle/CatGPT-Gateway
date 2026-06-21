@@ -65,7 +65,7 @@ COPY .env.example .env
 
 # ── Directory setup ─────────────────────────────────────────────
 # These will be overridden by volume mounts in docker-compose
-RUN mkdir -p /app/browser_data /app/logs /app/downloads/images
+RUN mkdir -p /app/browser_data /app/logs /app/downloads/images /app/downloads/audio
 
 # ── Supervisor & entrypoint ─────────────────────────────────────
 COPY docker/supervisord.conf /etc/supervisor/conf.d/catgpt.conf

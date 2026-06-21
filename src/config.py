@@ -33,6 +33,7 @@ class Config:
     BROWSER_DATA_DIR: Path = _PROJECT_ROOT / os.getenv("BROWSER_DATA_DIR", "browser_data")
     LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
     IMAGES_DIR: Path = _PROJECT_ROOT / os.getenv("IMAGES_DIR", "downloads/images")
+    AUDIO_DIR: Path = _PROJECT_ROOT / os.getenv("AUDIO_DIR", "downloads/audio")
 
     # Browser
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
@@ -85,3 +86,4 @@ class Config:
         cls.BROWSER_DATA_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
         cls.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        cls.AUDIO_DIR.mkdir(parents=True, exist_ok=True)

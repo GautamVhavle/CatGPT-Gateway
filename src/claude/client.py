@@ -17,7 +17,7 @@ from patchright.async_api import Page
 
 from src.config import Config
 from src.claude.selectors import ClaudeSelectors
-from src.browser.human import human_type, human_click, thinking_pause, random_delay
+from src.browser.human import human_type, human_click, random_delay
 from src.claude.detector import (
     wait_for_response_complete,
     extract_last_response_via_copy,
@@ -48,7 +48,13 @@ class ClaudeClient:
 
     # ── Core: Send & Receive ────────────────────────────────────
 
-    async def send_message(self, text: str, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> ChatResponse:
+    async def send_message(
+        self,
+        text: str,
+        image_paths: list[str] | None = None,
+        file_paths: list[str] | None = None,
+        read_aloud: bool = False,
+    ) -> ChatResponse:
         """
         Send a message to Claude and wait for the complete response.
 
@@ -56,6 +62,7 @@ class ClaudeClient:
             text: The message text to send.
             image_paths: Optional list of local file paths to images to attach.
             file_paths: Optional list of local file paths to non-image files.
+            read_aloud: Accepted for API compatibility. Not currently supported for Claude.
 
         Returns ChatResponse with the assistant's reply and metadata.
         """
@@ -141,6 +148,8 @@ class ClaudeClient:
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         thread_id = self._extract_thread_id()
+        if read_aloud:
+            log.warning("read_aloud=True requested, but Claude read-aloud audio is not implemented")
 
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars): "
@@ -153,6 +162,8 @@ class ClaudeClient:
             response_time_ms=elapsed_ms,
             images=[],
             has_images=False,
+            audio=None,
+            has_audio=False,
         )
 
     # ── Navigation ──────────────────────────────────────────────

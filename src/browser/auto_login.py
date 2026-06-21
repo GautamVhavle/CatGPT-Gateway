@@ -41,7 +41,7 @@ async def ensure_logged_in(browser: BrowserManager) -> bool:
     print("=" * 60)
     print(f"\n  Browser data dir: {Config.BROWSER_DATA_DIR}")
     print(f"  Target: {target_url}")
-    print(f"\n  A Chrome window is open. Please:")
+    print("\n  A Chrome window is open. Please:")
     print(f"  1. Sign in to {provider_name} with your account")
     print("  2. Complete any CAPTCHA / verification checks")
     print("  3. Wait until you see the chat interface")

@@ -90,7 +90,7 @@ The gateway uses multiple techniques to avoid bot detection:
 ## Message Flow
 
 ```
-send_message(text, image_paths, file_paths)
+send_message(text, image_paths, file_paths, read_aloud)
 |
 |-- 1. Count existing assistant messages (pre_count)
 |-- 2. Random delay (500-1200ms, human simulation)
@@ -107,7 +107,9 @@ send_message(text, image_paths, file_paths)
 |-- 11. Extract response text
 |       |-- Image response: DOM scraping
 |       +-- Text response: copy button click
-+-- 12. Return ChatResponse(message, thread_id, elapsed_ms, images)
+|-- 12. If read_aloud=True, click More actions -> Read aloud (ChatGPT only)
+|       +-- Capture the browser audio response and save to downloads/audio
++-- 13. Return ChatResponse(message, thread_id, elapsed_ms, images, audio)
 ```
 
 ---
@@ -237,6 +239,7 @@ src/chatgpt/
 |-- detector.py     ChatGPT-specific response detection
 |-- selectors.py    (uses src/selectors.py)
 |-- image_handler.py  DALL-E image detection
+|-- audio_handler.py  Read-aloud audio capture/download
 +-- models.py
 
 src/claude/

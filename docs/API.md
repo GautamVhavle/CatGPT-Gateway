@@ -89,6 +89,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `temperature` | float | no | Ignored (browser controls this) |
 | `max_tokens` | int | no | Ignored |
 | `stream` | bool | no | Must be `false` (streaming not supported) |
+| `read_aloud` | bool | no | ChatGPT only. Opens `More actions` -> `Read aloud`, downloads the browser-generated audio, and returns it at `choices[0].message.audio`. |
 
 **Response:**
 
@@ -104,7 +105,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
       "message": {
         "role": "assistant",
         "content": "Quantum computing uses quantum bits...",
-        "tool_calls": null
+        "tool_calls": null,
+        "audio": null
       },
       "finish_reason": "stop"
     }
@@ -115,6 +117,50 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "total_tokens": 175
   }
 }
+```
+
+---
+
+### Read-Aloud Audio
+
+For ChatGPT, add the custom `read_aloud: true` flag to generate speech from the browser UI after the assistant response is complete. The gateway clicks the latest response's `More actions` menu, selects `Read aloud`, captures the audio response from the browser, and saves it under `downloads/audio`.
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy123" \
+  -d '{
+    "model": "catgpt-browser",
+    "messages": [{"role": "user", "content": "Reply with one short sentence."}],
+    "read_aloud": true
+  }'
+```
+
+The audio metadata is returned on the assistant message:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "Here is one short sentence.",
+      "audio": {
+        "url": "https://chatgpt.com/...",
+        "local_path": "downloads/audio/read_aloud_1716025800_abcd1234.mp3",
+        "mime_type": "audio/mpeg",
+        "size_bytes": 123456
+      }
+    }
+  }]
+}
+```
+
+Claude accepts the flag for compatibility but currently returns no audio.
+
+Manual test:
+
+```bash
+python scripts/test_read_aloud.py
 ```
 
 ---
@@ -396,6 +442,12 @@ curl -X POST http://localhost:8000/chat \
   -H "Authorization: Bearer dummy123" \
   -d '{"message": "Hello!"}'
 
+# Chat and download read-aloud audio (ChatGPT only)
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy123" \
+  -d '{"message": "Reply with one short sentence.", "read_aloud": true}'
+
 # Start new thread
 curl -X POST http://localhost:8000/thread/new \
   -H "Content-Type: application/json" \
@@ -445,3 +497,4 @@ Shortcuts: `Ctrl+N` (new), `Ctrl+T` (threads), `Ctrl+L` (clear), `Ctrl+Q` (quit)
 | `tool_choice` support | Yes | Yes |
 | Vision input | Yes | Yes |
 | File attachments | Yes | Yes |
+| Read-aloud audio | Not implemented | Supported via `read_aloud: true` |

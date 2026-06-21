@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
         log.info("Not logged in — starting auto-login flow...")
         logged_in = await ensure_logged_in(_browser)
         if not logged_in:
-            log.error(f"Login failed after auto-login attempt")
+            log.error("Login failed after auto-login attempt")
             raise RuntimeError(f"Could not log in to {provider_name}")
 
     if Config.PROVIDER == "claude":

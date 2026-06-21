@@ -12,7 +12,6 @@ import re
 
 from patchright.async_api import Page
 
-from src.claude.selectors import ClaudeSelectors
 from src.browser.human import idle_mouse_movement
 from src.log import setup_logging
 from src.config import Config

@@ -239,7 +239,7 @@ Default: `catgpt`. Change it via `VNC_PASSWORD` in `.env` or `docker-compose.yml
 
 ### Startup Sequence
 
-1. Create directories (`browser_data`, `logs`, `downloads/images`)
+1. Create directories (`browser_data`, `logs`, `downloads/images`, `downloads/audio`)
 2. Clean stale Chrome lock files
 3. Set up VNC password
 4. Pre-resolve DNS domains and write to `/etc/hosts` (Docker DNS workaround)
@@ -252,6 +252,7 @@ Default: `catgpt`. Change it via `VNC_PASSWORD` in `.env` or `docker-compose.yml
 |---|---|
 | `catgpt_browser_data:/app/browser_data` | Persistent browser session (cookies, login) |
 | `./docker-logs:/app/logs` | Logs accessible from host |
+| `./downloads:/app/downloads` | Generated images and read-aloud audio accessible from host |
 
 ### Health Check
 

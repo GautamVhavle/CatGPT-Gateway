@@ -132,7 +132,7 @@ async def main():
             if Config.PROVIDER == "claude" and test.get("expect_image"):
                 print(f"\n  {'─' * 60}")
                 print(f"  Test {i}/{len(TESTS)}: {test['name']}")
-                print(f"  ⏭️  SKIPPED — image generation not supported by Claude")
+                print("  ⏭️  SKIPPED — image generation not supported by Claude")
                 results.append({
                     "test": test["name"],
                     "passed": True,
@@ -150,7 +150,7 @@ async def main():
             print(f"  Prompt: {test['prompt'][:65]}...")
             expects = "image" if test.get("expect_image") else "text only"
             print(f"  Expects: {expects}")
-            print(f"  ⏳ Sending...")
+            print("  ⏳ Sending...")
 
             try:
                 response = await client.send_message(test["prompt"])

@@ -30,6 +30,8 @@ services:
       - catgpt_browser_data:/app/browser_data
       # Logs accessible from host
       - ./docker-logs:/app/logs
+      # Generated images/audio accessible from host
+      - ./downloads:/app/downloads
 
     environment:
       # Browser (headed on virtual display)
@@ -63,6 +65,7 @@ services:
       - API_HOST=0.0.0.0
       - API_PORT=8000
       - API_TOKEN=dummy123
+      - AUDIO_DIR=/app/downloads/audio
 
       # VNC Authentication
       - VNC_PASSWORD=catgpt

@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException
 from src.api.schemas import (
     ChatRequest,
     ChatResponse,
+    AudioInfoResponse,
     ImageInfoResponse,
     StatusResponse,
     ThreadInfo,
@@ -64,12 +65,22 @@ def _build_response(result) -> ChatResponse:
         )
         for img in (result.images or [])
     ]
+    audio = None
+    if result.audio:
+        audio = AudioInfoResponse(
+            url=result.audio.url,
+            local_path=result.audio.local_path,
+            mime_type=result.audio.mime_type,
+            size_bytes=result.audio.size_bytes,
+        )
     return ChatResponse(
         message=result.message,
         thread_id=result.thread_id,
         response_time_ms=result.response_time_ms,
         images=images,
         has_images=result.has_images,
+        audio=audio,
+        has_audio=result.has_audio,
     )
 
 
@@ -84,7 +95,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     async with _lock:
         try:
-            result = await client.send_message(req.message)
+            result = await client.send_message(req.message, read_aloud=req.read_aloud)
             return _build_response(result)
         except Exception as e:
             log.error(f"Chat error: {e}", exc_info=True)
@@ -104,7 +115,7 @@ async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
             if current_tid != thread_id:
                 await client.navigate_to_thread(thread_id)
 
-            result = await client.send_message(req.message)
+            result = await client.send_message(req.message, read_aloud=req.read_aloud)
             return _build_response(result)
         except Exception as e:
             log.error(f"Thread chat error: {e}", exc_info=True)
@@ -120,7 +131,7 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
     async with _lock:
         try:
             await client.new_chat()
-            result = await client.send_message(req.message)
+            result = await client.send_message(req.message, read_aloud=req.read_aloud)
             return _build_response(result)
         except Exception as e:
             log.error(f"New thread error: {e}", exc_info=True)

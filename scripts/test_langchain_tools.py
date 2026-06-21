@@ -20,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import base64
-import json
 import os
 import sys
 from datetime import datetime
@@ -34,7 +33,7 @@ except ImportError:
     pass
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
 
@@ -158,7 +157,7 @@ def test_simple_chat():
     )
 
     response = llm.invoke([HumanMessage(content="Who is the president of the United States?")])
-    print(f"Question: Who is the president of the United States?")
+    print("Question: Who is the president of the United States?")
     print(f"Response: {response.content}")
     print(f"Type: {type(response).__name__}")
     print("✓ Simple chat works\n")
@@ -188,7 +187,7 @@ def test_tool_calling():
     print(f"Tool calls: {response.tool_calls}")
 
     if response.tool_calls:
-        print(f"\n✓ Model requested tool call(s):")
+        print("\n✓ Model requested tool call(s):")
         for tc in response.tool_calls:
             print(f"  - {tc['name']}({tc['args']})")
 
@@ -245,7 +244,7 @@ def test_add_numbers_tool():
     print(f"Tool calls: {response.tool_calls}")
 
     if response.tool_calls:
-        print(f"\n✓ Model requested tool call(s):")
+        print("\n✓ Model requested tool call(s):")
         for tc in response.tool_calls:
             print(f"  - {tc['name']}({tc['args']})")
 

@@ -23,8 +23,6 @@ Usage:
 from __future__ import annotations
 
 import base64
-import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -88,7 +86,7 @@ def test_1_basic_image_generation():
     }
 
     print(f"  Prompt: {payload['prompt']}")
-    print(f"  Sending request...")
+    print("  Sending request...")
     start = time.time()
 
     resp = requests.post(f"{BASE_URL}/v1/images/generations", headers=HEADERS, json=payload, timeout=180)
@@ -147,7 +145,7 @@ def test_2_save_generated_image():
 
     print(f"  Prompt: {payload['prompt']}")
     print(f"  Quality: {payload['quality']}")
-    print(f"  Sending request...")
+    print("  Sending request...")
     start = time.time()
 
     resp = requests.post(f"{BASE_URL}/v1/images/generations", headers=HEADERS, json=payload, timeout=180)
@@ -163,7 +161,7 @@ def test_2_save_generated_image():
     img = data["data"][0]
 
     if not img.get("b64_json"):
-        print(f"  FAILED: No b64_json in response")
+        print("  FAILED: No b64_json in response")
         return False
 
     filepath = save_b64_image(img["b64_json"], "test2_cyberpunk_city.png")
@@ -191,8 +189,8 @@ def test_3_url_format():
     }
 
     print(f"  Prompt: {payload['prompt']}")
-    print(f"  Response format: url")
-    print(f"  Sending request...")
+    print("  Response format: url")
+    print("  Sending request...")
     start = time.time()
 
     resp = requests.post(f"{BASE_URL}/v1/images/generations", headers=HEADERS, json=payload, timeout=180)
@@ -237,8 +235,8 @@ def test_4_openai_sdk():
 
     prompt = "A photorealistic golden retriever puppy wearing sunglasses on a beach"
     print(f"  Prompt: {prompt}")
-    print(f"  Using OpenAI SDK client.images.generate()")
-    print(f"  Sending request...")
+    print("  Using OpenAI SDK client.images.generate()")
+    print("  Sending request...")
     start = time.time()
 
     try:
@@ -292,7 +290,7 @@ def main():
         if health.status_code != 200:
             print(f"\n  ERROR: Server health check failed ({health.status_code})")
             sys.exit(1)
-        print(f"\n  Health check: OK")
+        print("\n  Health check: OK")
     except requests.ConnectionError:
         print(f"\n  ERROR: Cannot connect to {BASE_URL}")
         print("  Start the server: python -m src.api.server")
@@ -305,7 +303,7 @@ def main():
         if models.status_code == 401:
             print(f"  ERROR: Auth failed — check API_KEY (current: {API_KEY})")
             sys.exit(1)
-        print(f"  Auth check: OK\n")
+        print("  Auth check: OK\n")
     except Exception:
         pass
 

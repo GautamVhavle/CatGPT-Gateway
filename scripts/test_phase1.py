@@ -111,7 +111,7 @@ async def main(message: str, new_chat: bool, observe: bool):
         print(f"\n  Thread ID: {response.thread_id or '(not in URL yet)'}")
         print(f"  Response time: {response.response_time_ms}ms ({elapsed:.1f}s)")
         print(f"  Response length: {len(response.message)} chars")
-        print(f"\n  Response:")
+        print("\n  Response:")
         print(f"  {'─' * 50}")
         # Indent response for readability
         for line in response.message.split("\n"):
