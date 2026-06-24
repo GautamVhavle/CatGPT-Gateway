@@ -119,6 +119,35 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo = Field(default_factory=UsageInfo)
 
 
+# ── Streaming (chat.completion.chunk) ─────────────────────────
+# Used by /v1/chat/completions when the request sets stream=true. Since the
+# browser backend does not truly stream, the route handler buffers the full
+# response and re-emits it as a sequence of these chunks (see
+# _stream_chat_completion_chunks in openai_routes.py).
+
+
+class ChoiceDelta(BaseModel):
+    """Incremental update to an assistant message during streaming."""
+    role: Optional[str] = None
+    content: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None
+
+
+class ChoiceChunk(BaseModel):
+    """A single streaming choice (mirrors Choice but uses delta instead of message)."""
+    index: int = 0
+    delta: ChoiceDelta = Field(default_factory=ChoiceDelta)
+    finish_reason: Optional[str] = None  # null until the final chunk
+
+
+class ChatCompletionChunk(BaseModel):
+    """One SSE chunk of an OpenAI-compatible streaming chat completion."""
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:24]}")
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str = "catgpt-browser"
+    choices: list[ChoiceChunk]
+
 # ── Models endpoint ─────────────────────────────────────────────
 
 

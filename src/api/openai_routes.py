@@ -22,10 +22,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.api.openai_schemas import (
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
     Choice,
+    ChoiceChunk,
+    ChoiceDelta,
     ChoiceMessage,
     FunctionCallInfo,
     FunctionDefinition,
@@ -739,10 +742,74 @@ async def create_image(
         return ImagesResponse(data=image_data_list)
 
 
-@openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def _stream_chat_completion_chunks(
+    response: ChatCompletionResponse,
+    words_per_chunk: int = 1,
+    delay_seconds: float = 0.01,
+):
+    """
+    Emit a buffered ChatCompletionResponse as a sequence of SSE chunks
+    conforming to the OpenAI chat.completion.chunk contract.
+
+    The browser backend cannot truly stream tokens (it polls the copy
+    button for turn-completion). So we accept the full response, then
+    fan it out as word-sized deltas with a small delay between chunks
+    to give SDK consumers (LangChain, openai-python with stream=True,
+    pi-src, etc.) progressive UX. Tool calls are emitted in a single
+    burst chunk since they are not text.
+
+    Chunk sequence:
+      1. opening chunk with delta.role = "assistant" (no content yet)
+      2. either:
+         - N text chunks each carrying delta.content = next word, OR
+         - one chunk carrying delta.tool_calls = [...]
+      3. final chunk with empty delta + finish_reason set
+      4. literal "data: [DONE]\n\n" sentinel
+    """
+    choice = response.choices[0]
+    base_id = response.id
+    base_created = response.created
+    base_model = response.model
+
+    def _chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> str:
+        chunk = ChatCompletionChunk(
+            id=base_id,
+            created=base_created,
+            model=base_model,
+            choices=[ChoiceChunk(index=0, delta=delta, finish_reason=finish_reason)],
+        )
+        return f"data: {chunk.model_dump_json(exclude_none=False)}\n\n"
+
+    # 1) opening chunk: role only
+    yield _chunk(ChoiceDelta(role="assistant"))
+
+    # 2) body
+    if choice.message.tool_calls:
+        # Tool calls: emit as one chunk (no point chunking JSON arguments)
+        yield _chunk(ChoiceDelta(tool_calls=choice.message.tool_calls))
+    elif choice.message.content:
+        # Text content: split into word-sized chunks with delay for UX
+        words = choice.message.content.split(" ")
+        for i in range(0, len(words), words_per_chunk):
+            piece = " ".join(words[i : i + words_per_chunk])
+            # Re-attach trailing space between word groups so output reads naturally
+            if i + words_per_chunk < len(words):
+                piece = piece + " "
+            yield _chunk(ChoiceDelta(content=piece))
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+    # 3) final chunk with finish_reason
+    yield _chunk(ChoiceDelta(), finish_reason=choice.finish_reason)
+
+    # 4) SSE termination sentinel
+    yield "data: [DONE]\n\n"
+
+
+@openai_router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
-) -> ChatCompletionResponse:
+):
     """
     OpenAI-compatible chat completions endpoint.
 
@@ -751,12 +818,6 @@ async def create_chat_completion(
     Supports tool/function calling via prompt injection.
     """
     # ── Validate ────────────────────────────────────────────
-    if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported. Set stream=false or omit it.",
-        )
-
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
@@ -890,6 +951,13 @@ async def create_chat_completion(
         )
 
         _increment_thread_count()
+
+        # ââ Stream or return ââââââââââââââââââââââââââââââââââââ
+        if request.stream:
+            return StreamingResponse(
+                _stream_chat_completion_chunks(response),
+                media_type="text/event-stream",
+            )
         return response
 
 
