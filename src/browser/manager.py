@@ -1,38 +1,44 @@
 """
-Browser lifecycle manager — launch, persist, close.
+Browser lifecycle manager -- launch, persist, close.
 
-Uses a persistent Chrome context so the user only signs in once.
-Session data (cookies, localStorage, IndexedDB) survives restarts.
+This version uses SeleniumBase Stealthy Playwright Mode:
+SeleniumBase launches a stealthy Chrome / Chromium session through CDP, then
+Playwright attaches to that session with connect_over_cdp(). The rest of the
+application keeps using the standard Playwright async Page API.
 """
-
 from __future__ import annotations
 
+import inspect
 import os
 import random
-import signal
 import socket
 from pathlib import Path
-from patchright.async_api import async_playwright, BrowserContext, Page, Playwright
+from typing import Any
+
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from seleniumbase import cdp_driver
 
 from src.config import Config
-from src.browser.stealth import apply_stealth
 from src.log import setup_logging
 
 log = setup_logging("browser")
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _resolve_domains_for_chrome() -> str:
     """
-    Pre-resolve key domains via the OS and return a --host-resolver-rules
-    string for Chrome.
+    Pre-resolve key domains through the OS resolver and return a Chrome
+    --host-resolver-rules value.
 
-    Chrome's built-in DNS client (even with --disable-features=AsyncDns)
-    is unreliable — it can return DNS_PROBE_FINISHED_NXDOMAIN for domains
-    that the OS resolver handles fine.  By pre-resolving here and passing
-    the IPs via --host-resolver-rules, Chrome bypasses its own resolver
-    entirely and the problem disappears.
-
-    Returns empty string if all resolutions fail.
+    Chrome's built-in DNS resolver can be unreliable in some Docker / Xvfb
+    setups. Mapping known provider domains through the OS resolver keeps the
+    existing CatGPT DNS workaround while changing the automation backend.
     """
     domains = [
         "chatgpt.com",
@@ -53,75 +59,61 @@ def _resolve_domains_for_chrome() -> str:
         "anthropic.com",
         "www.anthropic.com",
     ]
-    rules = []
+    rules: list[str] = []
     for domain in domains:
         try:
             ip = socket.gethostbyname(domain)
             rules.append(f"MAP {domain} {ip}")
             log.debug(f"DNS pre-resolve: {domain} -> {ip}")
-        except Exception as e:
-            log.warning(f"DNS pre-resolve failed: {domain} -> {e}")
-
+        except Exception as exc:  # pragma: no cover - best effort hardening
+            log.warning(f"DNS pre-resolve failed: {domain} -> {exc}")
     if rules:
-        result = ", ".join(rules)
         log.info(f"Chrome host-resolver-rules: {len(rules)} domains mapped")
-        return result
+        return ", ".join(rules)
     return ""
 
 
 def _cleanup_stale_locks(data_dir: Path) -> None:
-    """
-    Remove stale lock / journal / WAL files that prevent browser launch.
-
-    After a crash, Chromium leaves behind:
-    - SingletonLock/Socket/Cookie — prevents new instance from using data dir.
-    - *-journal, *-wal, *-shm — SQLite journal/WAL files that cause
-      "database is locked" errors (UKM, Top Sites, History, etc.)
-
-    We also attempt to kill any orphan Chromium processes that are using
-    our user-data-dir.
-    """
+    """Remove stale Chromium locks and cache files from crashed sessions."""
+    import glob
+    import shutil
     import subprocess
+    import time
 
-    # 1. Kill orphan Chromium processes FIRST.
-    #    Match multiple patterns: the macOS app name has spaces ("Google Chrome
-    #    for Testing"), Linux uses lowercase hyphens ("chrome-for-testing"),
-    #    and generic "chromium" for bundled builds.
+    # 1. Kill orphan browser processes that may still be using the profile.
     kill_patterns = [
         "Google Chrome for Testing",
         "chrome-for-testing",
         "chromium",
+        "chrome",
     ]
     for pattern in kill_patterns:
         try:
             result = subprocess.run(
                 ["pkill", "-9", "-f", pattern],
-                capture_output=True, timeout=3
+                capture_output=True,
+                timeout=3,
             )
             if result.returncode == 0:
                 log.info(f"Killed orphan browser processes matching '{pattern}'")
-                import time
                 time.sleep(1)
         except Exception:
-            pass  # Non-critical
+            pass
 
-    # 2. Remove singleton lock files
-    lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
-    for name in lock_files:
+    # 2. Remove singleton lock files.
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         path = data_dir / name
         if path.exists():
             try:
                 path.unlink()
                 log.info(f"Removed stale lock file: {name}")
-            except Exception as e:
-                log.warning(f"Could not remove {name}: {e}")
+            except Exception as exc:
+                log.warning(f"Could not remove {name}: {exc}")
 
-    # 3. Remove SQLite journal/WAL/SHM files that cause "database is locked"
-    import glob as _glob
-    patterns = ["**/*-journal", "**/*-wal", "**/*-shm"]
+    # 3. Remove SQLite journal/WAL/SHM files that cause locked profile errors.
     removed = 0
-    for pattern in patterns:
-        for path_str in _glob.glob(str(data_dir / pattern), recursive=True):
+    for pattern in ("**/*-journal", "**/*-wal", "**/*-shm"):
+        for path_str in glob.glob(str(data_dir / pattern), recursive=True):
             try:
                 Path(path_str).unlink()
                 removed += 1
@@ -130,13 +122,7 @@ def _cleanup_stale_locks(data_dir: Path) -> None:
     if removed:
         log.info(f"Removed {removed} stale SQLite journal/WAL/SHM files")
 
-    # 4. Clear ALL network / DNS / cache state that can corrupt Chrome's
-    #    resolver and cause DNS_PROBE_FINISHED_NXDOMAIN for every domain.
-    #    Chrome's built-in DNS client stores state in the persistent profile
-    #    that survives restarts and can poison resolution for ALL sites.
-    import shutil
-
-    # 4a. Delete network state files (DNS, QUIC, HTTP/3 connection cache)
+    # 4. Clear network/cache state that can poison Chrome DNS resolution.
     network_files = [
         "Default/Network Persistent State",
         "Default/Network Action Predictor",
@@ -156,8 +142,6 @@ def _cleanup_stale_locks(data_dir: Path) -> None:
             except Exception:
                 pass
 
-    # 4b. Delete cache directories (HTTP cache, compiled JS, GPU shaders).
-    #     These can grow large and contain stale connection/DNS info.
     cache_dirs = [
         "Default/Cache",
         "Default/Code Cache",
@@ -179,189 +163,149 @@ def _cleanup_stale_locks(data_dir: Path) -> None:
                 pass
 
 
+def _get_endpoint_url(driver: Any) -> str:
+    """Return the remote debugging endpoint URL from a SeleniumBase driver."""
+    for method_name in ("get_endpoint_url", "get_rd_url"):
+        method = getattr(driver, method_name, None)
+        if callable(method):
+            endpoint = method()
+            if endpoint:
+                return str(endpoint)
+    host_method = getattr(driver, "get_rd_host", None)
+    port_method = getattr(driver, "get_rd_port", None)
+    if callable(host_method) and callable(port_method):
+        return f"http://{host_method()}:{port_method()}"
+    raise RuntimeError("SeleniumBase did not expose a remote debugging endpoint")
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 class BrowserManager:
-    """Manages a single persistent Chromium browser context."""
+    """Manages a single SeleniumBase-backed Playwright browser session."""
 
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._seleniumbase_driver: Any | None = None
 
     async def start(self) -> Page:
         """
-        Launch a persistent Chrome context with stealth and human-like settings.
+        Launch SeleniumBase CDP Mode and attach Playwright over CDP.
 
-        Automatically cleans up stale lock files from previous crashed sessions.
-        Returns the active page ready for navigation.
+        SeleniumBase owns the browser process/profile. Playwright connects to
+        the remote-debugging endpoint and exposes a normal async Page object to
+        the existing ChatGPT / Claude clients.
         """
         Config.ensure_dirs()
-
-        # Clean up stale locks from previous sessions
         _cleanup_stale_locks(Config.BROWSER_DATA_DIR)
 
-        log.info("Launching browser...")
-        self._playwright = await async_playwright().start()
-
-        # Randomize viewport slightly to avoid fingerprint consistency
         width = Config.VIEWPORT_WIDTH + random.randint(-20, 20)
         height = Config.VIEWPORT_HEIGHT + random.randint(-20, 20)
 
-        # Try real Chrome first, fall back to bundled Chromium
-        chrome_args = [
+        browser_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
-            # Disable Chrome's built-in DNS client entirely.  Even with
-            # AsyncDns off, Chrome's stub resolver can return NXDOMAIN for
-            # domains the OS resolves fine.  We also pre-resolve domains
-            # via --host-resolver-rules (see _resolve_domains_for_chrome).
             "--disable-features=AsyncDns,DnsOverHttps",
             "--dns-prefetch-disable",
+            "--lang=en-US",
+            f"--window-size={width},{height}",
         ]
-
-        # Docker-specific flags
         if os.path.exists("/.dockerenv") or os.environ.get("DISPLAY") == ":99":
-            chrome_args.extend([
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-            ])
+            browser_args.extend(
+                [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                ]
+            )
 
-        # Pre-resolve domains via the OS and hardcode the IPs for Chrome.
-        # This prevents Chrome's built-in DNS client from ever being used.
         resolver_rules = _resolve_domains_for_chrome()
         if resolver_rules:
-            chrome_args.append(f"--host-resolver-rules={resolver_rules}")
+            browser_args.append(f"--host-resolver-rules={resolver_rules}")
 
-        launch_kwargs = dict(
-            user_data_dir=str(Config.BROWSER_DATA_DIR),
-            headless=Config.HEADLESS,
-            slow_mo=Config.SLOW_MO,
-            viewport={"width": width, "height": height},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-            args=chrome_args,
+        use_chromium = _env_bool("SELENIUMBASE_USE_CHROMIUM", default=True)
+        log.info(
+            "Launching SeleniumBase Stealthy Playwright browser "
+            f"(profile={Config.BROWSER_DATA_DIR}, chromium={use_chromium})"
         )
 
+        self._seleniumbase_driver = await cdp_driver.start_async(
+            user_data_dir=str(Config.BROWSER_DATA_DIR),
+            headless=Config.HEADLESS,
+            use_chromium=use_chromium,
+            browser_args=browser_args,
+        )
+
+        # Ensure the SeleniumBase CDP browser has at least one tab before
+        # Playwright attaches to it.
         try:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                channel="chrome", **launch_kwargs
-            )
-            log.info("Launched with real Chrome")
-        except Exception:
-            log.info("Real Chrome not found, using bundled Chromium")
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **launch_kwargs
+            await self._seleniumbase_driver.get("about:blank", lang="en")
+        except Exception as exc:
+            log.debug(f"SeleniumBase initial tab setup skipped: {exc}")
+
+        endpoint_url = _get_endpoint_url(self._seleniumbase_driver)
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.connect_over_cdp(
+            endpoint_url,
+            slow_mo=Config.SLOW_MO,
+        )
+
+        if self._browser.contexts:
+            self._context = self._browser.contexts[0]
+        else:
+            self._context = await self._browser.new_context(
+                viewport={"width": width, "height": height},
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
             )
 
-        # NOTE: Stealth patches are applied AFTER the first navigation.
-        # In Docker, applying stealth init scripts before navigation
-        # causes Chrome's DNS resolver to fail (ERR_NAME_NOT_RESOLVED).
-        # Call apply_stealth_patches() after navigating to the target page.
-
-        # Use existing page or create one
         if self._context.pages:
             self._page = self._context.pages[0]
         else:
             self._page = await self._context.new_page()
 
-        # NOTE: We intentionally do NOT flush Chrome's DNS cache here.
-        # The --host-resolver-rules flag handles DNS resolution for all
-        # mapped domains.  Previously, _clear_dns_cache() would navigate
-        # to chrome://net-internals and flush the host cache + socket
-        # pools — but this destroyed working connection state and caused
-        # DNS_PROBE_FINISHED_NXDOMAIN on subsequent navigations.
+        try:
+            await self._page.set_viewport_size({"width": width, "height": height})
+        except Exception as exc:
+            log.debug(f"Could not resize Playwright page: {exc}")
 
-        log.info(f"Browser ready — viewport {width}x{height}")
+        log.info(f"Browser ready via SeleniumBase CDP + Playwright -- viewport {width}x{height}")
         return self._page
 
     async def _clear_dns_cache(self) -> None:
-        """Clear Chrome's in-memory DNS host cache via chrome://net-internals."""
-        import asyncio as _asyncio
-
-        if self._page is None:
-            return
-
-        try:
-            await self._page.goto(
-                "chrome://net-internals/#dns",
-                wait_until="domcontentloaded",
-                timeout=10000,
-            )
-            await _asyncio.sleep(0.5)
-
-            # The "Clear host cache" button ID in chrome://net-internals/#dns
-            cleared = await self._page.evaluate(
-                """
-                () => {
-                    // Try the standard button
-                    const btn = document.getElementById('dns-view-clear-cache');
-                    if (btn) { btn.click(); return 'clicked-dns-view-clear-cache'; }
-                    // Newer Chrome: look for any button that says "Clear"
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    for (const b of buttons) {
-                        if (b.textContent.toLowerCase().includes('clear')) {
-                            b.click();
-                            return 'clicked-' + b.textContent.trim();
-                        }
-                    }
-                    return 'no-clear-button-found';
-                }
-                """
-            )
-            log.info(f"Chrome DNS cache flush: {cleared}")
-            await _asyncio.sleep(0.3)
-
-            # Also try to flush socket pools
-            try:
-                await self._page.goto(
-                    "chrome://net-internals/#sockets",
-                    wait_until="domcontentloaded",
-                    timeout=5000,
-                )
-                await _asyncio.sleep(0.3)
-                await self._page.evaluate(
-                    """
-                    () => {
-                        const buttons = Array.from(document.querySelectorAll('button'));
-                        for (const b of buttons) {
-                            if (b.textContent.toLowerCase().includes('flush') ||
-                                b.textContent.toLowerCase().includes('close')) {
-                                b.click();
-                            }
-                        }
-                    }
-                    """
-                )
-                log.info("Chrome socket pools flushed")
-            except Exception:
-                pass  # Best-effort
-
-        except Exception as e:
-            log.warning(f"Could not clear Chrome DNS cache: {e}")
+        """No-op placeholder kept for compatibility with older call sites."""
+        log.debug("DNS cache clear skipped; browser uses host-resolver-rules")
 
     async def apply_stealth_patches(self) -> None:
         """
-        Apply stealth patches to the browser context.
+        Compatibility hook for the old Patchright + playwright-stealth path.
 
-        Must be called AFTER the first page navigation, not before.
-        In Docker containers, applying stealth init scripts before any
-        navigation causes Chrome's DNS resolver to fail.
+        SeleniumBase Stealthy Playwright Mode applies stealth at launch by
+        starting a SeleniumBase CDP browser and attaching Playwright to it. No
+        extra init scripts are required here.
         """
         if self._context is None:
             raise RuntimeError("Browser not started. Call start() first.")
-        await apply_stealth(self._context)
+        log.debug("Stealth patches already supplied by SeleniumBase CDP Mode")
 
     @property
     def page(self) -> Page:
-        """Get the active page. Raises if browser not started."""
+        """Get the active Playwright page. Raises if browser not started."""
         if self._page is None:
             raise RuntimeError("Browser not started. Call start() first.")
         return self._page
 
     @property
     def context(self) -> BrowserContext:
-        """Get the browser context."""
+        """Get the active Playwright browser context."""
         if self._context is None:
             raise RuntimeError("Browser not started. Call start() first.")
         return self._context
@@ -373,20 +317,19 @@ class BrowserManager:
         log.info("Page loaded")
 
     async def recover_page(self) -> bool:
-        """Recover from DNS / page errors by re-navigating to ChatGPT.
-
-        Tries JS navigation first (avoids DNS lookup), then page.goto().
-        Returns True if recovery succeeded, False otherwise.
+        """
+        Recover from DNS / page errors by re-navigating to the active provider.
         """
         import asyncio as _asyncio
 
         if self._page is None:
             return False
 
-        # Strategy 1: JS navigation (doesn't go through Chrome's DNS resolver)
+        target_url = Config.CLAUDE_URL if Config.PROVIDER == "claude" else Config.CHATGPT_URL
+
         try:
             log.info("Page recovery via JS navigation...")
-            await self._page.evaluate(f"window.location.href = '{Config.CHATGPT_URL}'")
+            await self._page.evaluate(f"window.location.href = '{target_url}'")
             await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
             await _asyncio.sleep(1)
             error = await self._page.evaluate(
@@ -404,20 +347,18 @@ class BrowserManager:
                 log.info("Page recovery succeeded (JS navigation)")
                 return True
             log.warning(f"JS navigation recovery still shows error: {error}")
-        except Exception as e:
-            log.warning(f"JS navigation recovery failed: {e}")
+        except Exception as exc:
+            log.warning(f"JS navigation recovery failed: {exc}")
 
-        # Strategy 2: page.goto() with retries
         for attempt in range(1, 4):
             try:
                 log.info(f"Page recovery attempt {attempt}/3 (page.goto)...")
                 await self._page.goto(
-                    Config.CHATGPT_URL,
+                    target_url,
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
                 await _asyncio.sleep(1)
-
                 error = await self._page.evaluate(
                     """
                     () => {
@@ -433,12 +374,10 @@ class BrowserManager:
                     log.warning(f"Recovery attempt {attempt} still shows error: {error}")
                     await _asyncio.sleep(attempt * 2)
                     continue
-
                 log.info("Page recovery succeeded")
                 return True
-
-            except Exception as e:
-                log.warning(f"Recovery attempt {attempt} failed: {e}")
+            except Exception as exc:
+                log.warning(f"Recovery attempt {attempt} failed: {exc}")
                 await _asyncio.sleep(attempt * 2)
 
         log.error("Page recovery failed after all attempts")
@@ -446,12 +385,10 @@ class BrowserManager:
 
     async def is_logged_in(self) -> bool:
         """
-        Check if user is logged in by looking for chat input vs login indicators.
-
-        Returns True if the chat interface is visible, False if login page detected.
+        Check if user is logged in by looking for provider UI selectors.
         """
-        from src.selectors import Selectors
         from src.claude.selectors import ClaudeSelectors
+        from src.selectors import Selectors
 
         if Config.PROVIDER == "claude":
             chat_inputs = ClaudeSelectors.CHAT_INPUT
@@ -463,55 +400,62 @@ class BrowserManager:
             logged_in_indicators = []
 
         try:
-            # Try to find the chat input
             for selector in chat_inputs:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=3000)
-                    if el:
+                    element = await self.page.wait_for_selector(selector, timeout=3000)
+                    if element:
                         log.info("Login check: LOGGED IN (chat input found)")
                         return True
                 except Exception:
                     continue
 
-            # Claude: also check for user-menu-button as a logged-in signal
             for selector in logged_in_indicators:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
-                    if el:
+                    element = await self.page.wait_for_selector(selector, timeout=2000)
+                    if element:
                         log.info("Login check: LOGGED IN (user menu found)")
                         return True
                 except Exception:
                     continue
 
-            # Check for login indicators
             for selector in login_indicators:
                 try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
-                    if el:
+                    element = await self.page.wait_for_selector(selector, timeout=2000)
+                    if element:
                         log.warning("Login check: NOT LOGGED IN (login button found)")
                         return False
                 except Exception:
                     continue
 
-            log.warning("Login check: UNCERTAIN — no chat input or login button found")
+            log.warning("Login check: UNCERTAIN -- no chat input or login button found")
             return False
-
-        except Exception as e:
-            log.error(f"Login check error: {e}")
+        except Exception as exc:
+            log.error(f"Login check error: {exc}")
             return False
 
     async def close(self) -> None:
-        """Gracefully close the browser context and playwright instance."""
+        """Gracefully close Playwright and the SeleniumBase-owned browser."""
         log.info("Closing browser...")
         try:
-            if self._context:
-                await self._context.close()
+            if self._browser:
+                await self._browser.close()
             if self._playwright:
                 await self._playwright.stop()
-        except Exception as e:
-            log.error(f"Error closing browser: {e}")
+            if self._seleniumbase_driver:
+                for method_name in ("quit", "stop", "close"):
+                    method = getattr(self._seleniumbase_driver, method_name, None)
+                    if callable(method):
+                        try:
+                            await _maybe_await(method())
+                            break
+                        except Exception as exc:
+                            log.debug(f"SeleniumBase {method_name}() failed: {exc}")
+        except Exception as exc:
+            log.error(f"Error closing browser: {exc}")
         finally:
             self._context = None
             self._page = None
+            self._browser = None
             self._playwright = None
+            self._seleniumbase_driver = None
             log.info("Browser closed")
