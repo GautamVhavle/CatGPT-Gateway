@@ -1,6 +1,6 @@
-# Core
-patchright>=1.58
-playwright-stealth>=2.0.2
+# Core browser automation
+seleniumbase>=4.38
+playwright>=1.49
 
 # TUI (Phase 2)
 textual>=0.85
