@@ -46,6 +46,7 @@ from src.api.openai_schemas import (
 )
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
 from src.config import Config
 from src.log import setup_logging
 
@@ -54,7 +55,7 @@ log = setup_logging("openai_routes")
 openai_router = APIRouter()
 
 # Global reference — set by server.py at startup
-_client: ChatGPTClient | ClaudeClient | None = None
+_client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 
 # Serialize all requests — single browser page, not thread-safe.
 # Created lazily to avoid Python 3.9 event-loop binding issues.
@@ -123,20 +124,23 @@ def _increment_thread_count() -> None:
     log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
 
 
-def _get_model_id() -> str:
-    """Return model ID based on active provider."""
-    if Config.PROVIDER == "claude":
-        return "claude-browser"
-    return "catgpt-browser"
+def _resolve_model_id(requested: str | None) -> str:
+    """Resolve a request model against the active provider mapping."""
+    try:
+        return Config.resolve_model_id(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def set_openai_client(client: ChatGPTClient | ClaudeClient) -> None:
+def set_openai_client(
+    client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+) -> None:
     """Called by server.py to inject the client."""
     global _client
     _client = client
 
 
-def _get_client() -> ChatGPTClient | ClaudeClient:
+def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
@@ -607,12 +611,12 @@ def _parse_tool_calls(
 
 @openai_router.get("/v1/models", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
-    """List available models — returns our single browser-backed model."""
-    model_id = _get_model_id()
-    owned_by = "anthropic" if Config.PROVIDER == "claude" else "catgpt"
+    """List models exposed by the active provider."""
+    owned_by = Config.provider_owner()
     return ModelListResponse(
         data=[
-            ModelObject(id=model_id, owned_by=owned_by),
+            ModelObject(id=model_id, owned_by=owned_by)
+            for model_id in Config.provider_model_ids()
         ]
     )
 
@@ -633,11 +637,10 @@ async def create_image(
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt cannot be empty")
 
-    # Claude does not support image generation
-    if Config.PROVIDER == "claude":
+    if not Config.supports_image_generation():
         raise HTTPException(
             status_code=501,
-            detail="Image generation is not supported by Claude. This feature is only available with the ChatGPT provider.",
+            detail="Image generation is not supported by the active provider.",
         )
 
     client = _get_client()
@@ -761,6 +764,7 @@ async def create_chat_completion(
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
     client = _get_client()
+    model_id = _resolve_model_id(request.model)
 
     async with _get_lock():
         start_time = time.time()
@@ -781,7 +785,7 @@ async def create_chat_completion(
 
         prompt = _build_prompt(messages)
         log.info(
-            f"POST /v1/chat/completions — model={request.model}, "
+            f"POST /v1/chat/completions — model={model_id}, "
             f"{len(request.messages)} messages, prompt={len(prompt)} chars"
         )
 
@@ -810,12 +814,13 @@ async def create_chat_completion(
         # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
-        # ── Send to ChatGPT ────────────────────────────────
+        # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
+                model=model_id,
             )
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
@@ -826,7 +831,12 @@ async def create_chat_completion(
 
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
-        if response_text and has_tool_prompt and any(m in response_text for m in _echo_markers):
+        if (
+            Config.uses_browser()
+            and response_text
+            and has_tool_prompt
+            and any(m in response_text for m in _echo_markers)
+        ):
             log.warning("Response appears to echo the sent prompt — retrying extraction")
             try:
                 await asyncio.sleep(1.5)
@@ -865,7 +875,7 @@ async def create_chat_completion(
         completion_tokens = _estimate_tokens(response_text or "")
 
         response = ChatCompletionResponse(
-            model=request.model,
+            model=model_id,
             choices=[
                 Choice(
                     index=0,
@@ -1022,6 +1032,7 @@ def _build_response_object(
     request: "ResponsesRequest",
     prompt_tokens: int,
     completion_tokens: int,
+    model_id: str,
 ) -> ResponseObject:
     """Build a full ResponseObject from the model output."""
     now = int(time.time())
@@ -1063,7 +1074,7 @@ def _build_response_object(
         created_at=now,
         completed_at=now,
         status="completed",
-        model=request.model,
+        model=model_id,
         instructions=request.instructions,
         max_output_tokens=request.max_output_tokens,
         output=output,
@@ -1237,6 +1248,7 @@ async def create_response(request: ResponsesRequest):
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
     client = _get_client()
+    model_id = _resolve_model_id(request.model)
 
     async with _get_lock():
         start_time = time.time()
@@ -1266,7 +1278,7 @@ async def create_response(request: ResponsesRequest):
 
         prompt = _build_prompt(messages)
         log.info(
-            f"POST /v1/responses — model={request.model}, "
+            f"POST /v1/responses — model={model_id}, "
             f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
@@ -1274,9 +1286,9 @@ async def create_response(request: ResponsesRequest):
         # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
-        # ── Send to browser ────────────────────────────────
+        # ── Send to provider ───────────────────────────────
         try:
-            result = await client.send_message(prompt)
+            result = await client.send_message(prompt, model=model_id)
         except RuntimeError as e:
             err_msg = str(e).lower()
             if "error state" in err_msg or "could not find chat input" in err_msg:
@@ -1286,7 +1298,7 @@ async def create_response(request: ResponsesRequest):
                 if _browser and await _browser.recover_page():
                     # Retry after recovery
                     try:
-                        result = await client.send_message(prompt)
+                        result = await client.send_message(prompt, model=model_id)
                     except Exception as e2:
                         log.error(f"Provider error after recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1309,7 +1321,7 @@ async def create_response(request: ResponsesRequest):
                 from src.api.server import _browser
                 if _browser and await _browser.recover_page():
                     try:
-                        result = await client.send_message(prompt)
+                        result = await client.send_message(prompt, model=model_id)
                     except Exception as e2:
                         log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1335,7 +1347,8 @@ async def create_response(request: ResponsesRequest):
             "Available functions:",
         ]
         if (
-            response_text
+            Config.uses_browser()
+            and response_text
             and has_tool_prompt
             and any(m in response_text for m in _echo_markers)
         ):
@@ -1381,8 +1394,12 @@ async def create_response(request: ResponsesRequest):
         completion_tokens = _estimate_tokens(response_text or "")
 
         resp = _build_response_object(
-            response_text, tool_calls, request,
-            prompt_tokens, completion_tokens,
+            response_text,
+            tool_calls,
+            request,
+            prompt_tokens,
+            completion_tokens,
+            model_id,
         )
 
         log.info(

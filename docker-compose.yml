@@ -40,7 +40,7 @@ services:
       - DISPLAY_HEIGHT=768
       - DISPLAY_DEPTH=24
 
-      # Provider: "chatgpt" or "claude"
+      # Provider: "chatgpt", "claude", or "minimax"
       - PROVIDER=chatgpt
 
       # ChatGPT
@@ -48,6 +48,12 @@ services:
 
       # Claude
       - CLAUDE_URL=https://claude.ai
+
+      # MiniMax
+      - MINIMAX_REGION=${MINIMAX_REGION:-global_en}
+      - MINIMAX_BASE_URL=${MINIMAX_BASE_URL:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+      - MINIMAX_MODEL=${MINIMAX_MODEL:-MiniMax-M3}
 
       # Timeouts
       - RESPONSE_TIMEOUT=120000

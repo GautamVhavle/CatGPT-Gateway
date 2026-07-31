@@ -43,7 +43,12 @@ from langchain_core.tools import tool
 BASE_URL = "http://localhost:8000/v1"
 # Auto-detect model from provider env var
 _provider = os.environ.get("PROVIDER", "chatgpt")
-MODEL = "claude-browser" if _provider == "claude" else "catgpt-browser"
+if _provider == "minimax":
+    MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
+elif _provider == "claude":
+    MODEL = "claude-browser"
+else:
+    MODEL = "catgpt-browser"
 API_KEY = "dummy123"  # CatGPT doesn't require auth
 
 # Image test assets

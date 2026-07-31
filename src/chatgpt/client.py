@@ -100,7 +100,13 @@ class ChatGPTClient:
 
     # ── Core: Send & Receive ────────────────────────────────────
 
-    async def send_message(self, text: str, image_paths: list[str] | None = None, file_paths: list[str] | None = None) -> ChatResponse:
+    async def send_message(
+        self,
+        text: str,
+        image_paths: list[str] | None = None,
+        file_paths: list[str] | None = None,
+        model: str | None = None,
+    ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
 
@@ -108,6 +114,7 @@ class ChatGPTClient:
             text: The message text to send.
             image_paths: Optional list of local file paths to images to attach.
             file_paths: Optional list of local file paths to non-image files (PDF, etc.).
+            model: Optional API model identifier. Browser selection is unchanged.
 
         Steps:
         1. Simulate thinking pause
