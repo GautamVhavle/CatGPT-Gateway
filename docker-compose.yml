@@ -53,7 +53,7 @@ services:
       - MINIMAX_REGION=${MINIMAX_REGION:-global_en}
       - MINIMAX_BASE_URL=${MINIMAX_BASE_URL:-}
       - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
-      - MINIMAX_MODEL=${MINIMAX_MODEL:-MiniMax-M3}
+      - MINIMAX_MODEL=${MINIMAX_MODEL:-MiniMax-M2.7}
 
       # Timeouts
       - RESPONSE_TIMEOUT=120000

@@ -106,6 +106,7 @@ class ChatGPTClient:
         image_paths: list[str] | None = None,
         file_paths: list[str] | None = None,
         model: str | None = None,
+        stateless: bool = False,
     ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
@@ -115,6 +116,7 @@ class ChatGPTClient:
             image_paths: Optional list of local file paths to images to attach.
             file_paths: Optional list of local file paths to non-image files (PDF, etc.).
             model: Optional API model identifier. Browser selection is unchanged.
+            stateless: Accepted for provider interface compatibility; ignored.
 
         Steps:
         1. Simulate thinking pause

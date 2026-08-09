@@ -89,6 +89,13 @@ async def _ensure_fresh_chat() -> None:
     """
     global _thread_message_count, _last_response_time
 
+    # API-backed providers do not need browser cooldowns or thread rotation.
+    # Their OpenAI-compatible calls are made statelessly below because each
+    # request already carries its complete conversation history.
+    if not Config.uses_browser():
+        _thread_message_count = 0
+        return
+
     # Enforce minimum gap between messages
     if _last_response_time > 0:
         elapsed = time.time() - _last_response_time
@@ -225,6 +232,17 @@ def _extract_file_attachments(content) -> list[dict]:
         if data_b64:
             files.append({"filename": filename, "data_b64": data_b64, "mime_type": mime_type})
     return files
+
+
+def _contains_attachment(content) -> bool:
+    """Return whether OpenAI chat/responses content contains an attachment."""
+    if isinstance(content, list):
+        return any(_contains_attachment(item) for item in content)
+    if not isinstance(content, dict):
+        return False
+    if content.get("type") in {"image_url", "file", "input_image", "input_file"}:
+        return True
+    return any(_contains_attachment(value) for value in content.values())
 
 
 async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catgpt_files") -> str | None:
@@ -763,6 +781,14 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
+    if Config.PROVIDER == "minimax" and any(
+        _contains_attachment(message.content) for message in request.messages
+    ):
+        raise HTTPException(
+            status_code=501,
+            detail="Attachments are not supported by the MiniMax provider.",
+        )
+
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
@@ -821,6 +847,7 @@ async def create_chat_completion(
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
                 model=model_id,
+                stateless=not Config.uses_browser(),
             )
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
@@ -1247,6 +1274,12 @@ async def create_response(request: ResponsesRequest):
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
+    if Config.PROVIDER == "minimax" and _contains_attachment(request.input):
+        raise HTTPException(
+            status_code=501,
+            detail="Attachments are not supported by the MiniMax provider.",
+        )
+
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
@@ -1288,7 +1321,11 @@ async def create_response(request: ResponsesRequest):
 
         # ── Send to provider ───────────────────────────────
         try:
-            result = await client.send_message(prompt, model=model_id)
+            result = await client.send_message(
+                prompt,
+                model=model_id,
+                stateless=not Config.uses_browser(),
+            )
         except RuntimeError as e:
             err_msg = str(e).lower()
             if "error state" in err_msg or "could not find chat input" in err_msg:
@@ -1298,7 +1335,11 @@ async def create_response(request: ResponsesRequest):
                 if _browser and await _browser.recover_page():
                     # Retry after recovery
                     try:
-                        result = await client.send_message(prompt, model=model_id)
+                        result = await client.send_message(
+                            prompt,
+                            model=model_id,
+                            stateless=not Config.uses_browser(),
+                        )
                     except Exception as e2:
                         log.error(f"Provider error after recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1321,7 +1362,11 @@ async def create_response(request: ResponsesRequest):
                 from src.api.server import _browser
                 if _browser and await _browser.recover_page():
                     try:
-                        result = await client.send_message(prompt, model=model_id)
+                        result = await client.send_message(
+                            prompt,
+                            model=model_id,
+                            stateless=not Config.uses_browser(),
+                        )
                     except Exception as e2:
                         log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
                         raise HTTPException(

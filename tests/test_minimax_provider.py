@@ -6,6 +6,8 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from src.api import openai_routes, server
 from src.api.openai_schemas import ChatCompletionRequest, ChatMessage
 from src.chatgpt.models import ChatResponse
@@ -59,6 +61,7 @@ class RecordingProviderClient:
         image_paths=None,
         file_paths=None,
         model: str | None = None,
+        stateless: bool = False,
     ) -> ChatResponse:
         self.model = model
         return ChatResponse(message="Provider response", thread_id="thread-id")
@@ -78,7 +81,7 @@ class MiniMaxProviderTests(unittest.TestCase):
         )
         self.assertEqual(
             Config.MINIMAX_MODEL_IDS,
-            ("MiniMax-M3", "MiniMax-M2.7"),
+            ("MiniMax-M2.7",),
         )
 
     def test_client_uses_selected_endpoint_and_model(self) -> None:
@@ -86,13 +89,11 @@ class MiniMaxProviderTests(unittest.TestCase):
         client = MiniMaxClient(
             api_key="test-key",
             base_url=Config.MINIMAX_BASE_URLS["cn_zh"],
-            model="MiniMax-M3",
+            model="MiniMax-M2.7",
             opener=opener,
         )
 
-        result = asyncio.run(
-            client.send_message("Hello", model="MiniMax-M2.7")
-        )
+        result = asyncio.run(client.send_message("Hello", model="MiniMax-M2.7"))
 
         self.assertEqual(result.message, "Provider response")
         self.assertTrue(result.thread_id)
@@ -117,11 +118,11 @@ class MiniMaxProviderTests(unittest.TestCase):
 
         self.assertEqual(
             [model.id for model in response.data],
-            ["MiniMax-M3", "MiniMax-M2.7"],
+            ["MiniMax-M2.7"],
         )
         self.assertEqual(
             [model.owned_by for model in response.data],
-            ["minimax", "minimax"],
+            ["minimax"],
         )
 
     def test_chat_route_maps_default_request_model(self) -> None:
@@ -144,13 +145,83 @@ class MiniMaxProviderTests(unittest.TestCase):
                     openai_routes.create_chat_completion(request)
                 )
 
-            self.assertEqual(client.model, "MiniMax-M3")
-            self.assertEqual(response.model, "MiniMax-M3")
+            self.assertEqual(client.model, "MiniMax-M2.7")
+            self.assertEqual(response.model, "MiniMax-M2.7")
         finally:
             openai_routes._client = previous_client
             openai_routes._lock = previous_lock
             openai_routes._thread_message_count = previous_count
             openai_routes._last_response_time = previous_response_time
+
+    def test_openai_requests_start_with_isolated_provider_history(self) -> None:
+        opener = RecordingOpener()
+        client = MiniMaxClient(api_key="test-key", opener=opener)
+        previous_client = openai_routes._client
+        previous_lock = openai_routes._lock
+        previous_count = openai_routes._thread_message_count
+        previous_response_time = openai_routes._last_response_time
+
+        try:
+            openai_routes._client = client
+            openai_routes._lock = None
+            openai_routes._thread_message_count = 0
+            openai_routes._last_response_time = 0.0
+            with patch.object(Config, "PROVIDER", "minimax"):
+                asyncio.run(
+                    openai_routes.create_chat_completion(
+                        ChatCompletionRequest(
+                            messages=[ChatMessage(role="user", content="first secret")]
+                        )
+                    )
+                )
+                asyncio.run(
+                    openai_routes.create_chat_completion(
+                        ChatCompletionRequest(
+                            messages=[ChatMessage(role="user", content="second request")]
+                        )
+                    )
+                )
+
+            payload = json.loads(opener.request.data.decode("utf-8"))
+            self.assertEqual(
+                payload["messages"],
+                [{"role": "user", "content": "second request"}],
+            )
+            self.assertEqual(client._messages, [])
+        finally:
+            openai_routes._client = previous_client
+            openai_routes._lock = previous_lock
+            openai_routes._thread_message_count = previous_count
+            openai_routes._last_response_time = previous_response_time
+
+    def test_chat_route_rejects_minimax_attachments_before_provider(self) -> None:
+        client = RecordingProviderClient()
+        request = ChatCompletionRequest(
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "Describe this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                    ],
+                )
+            ]
+        )
+        previous_client = openai_routes._client
+        openai_routes._client = client
+
+        try:
+            with patch.object(Config, "PROVIDER", "minimax"):
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(openai_routes.create_chat_completion(request))
+
+            self.assertEqual(raised.exception.status_code, 501)
+            self.assertIsNone(client.model)
+        finally:
+            openai_routes._client = previous_client
 
     def test_startup_selects_direct_client_without_browser(self) -> None:
         fake_client = object()

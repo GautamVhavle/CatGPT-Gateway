@@ -51,7 +51,7 @@ class Config:
         or MINIMAX_BASE_URLS.get(MINIMAX_REGION, MINIMAX_BASE_URLS["global_en"])
     ).rstrip("/")
     MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "").strip()
-    MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M3", "MiniMax-M2.7")
+    MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M2.7",)
     MINIMAX_MODEL: str = os.getenv(
         "MINIMAX_MODEL", MINIMAX_MODEL_IDS[0]
     ).strip()

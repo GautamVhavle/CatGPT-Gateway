@@ -44,7 +44,7 @@ BASE_URL = "http://localhost:8000/v1"
 # Auto-detect model from provider env var
 _provider = os.environ.get("PROVIDER", "chatgpt")
 if _provider == "minimax":
-    MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
+    MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
 elif _provider == "claude":
     MODEL = "claude-browser"
 else:

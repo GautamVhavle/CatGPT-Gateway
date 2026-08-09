@@ -54,6 +54,7 @@ class ClaudeClient:
         image_paths: list[str] | None = None,
         file_paths: list[str] | None = None,
         model: str | None = None,
+        stateless: bool = False,
     ) -> ChatResponse:
         """
         Send a message to Claude and wait for the complete response.
@@ -63,6 +64,7 @@ class ClaudeClient:
             image_paths: Optional list of local file paths to images to attach.
             file_paths: Optional list of local file paths to non-image files.
             model: Optional API model identifier. Browser selection is unchanged.
+            stateless: Accepted for provider interface compatibility; ignored.
 
         Returns ChatResponse with the assistant's reply and metadata.
         """

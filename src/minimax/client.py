@@ -58,6 +58,7 @@ class MiniMaxClient:
         image_paths: list[str] | None = None,
         file_paths: list[str] | None = None,
         model: str | None = None,
+        stateless: bool = False,
     ) -> ChatResponse:
         """Send a text message and return a normalized provider response."""
         if image_paths or file_paths:
@@ -67,20 +68,27 @@ class MiniMaxClient:
 
         model_id = self._resolve_model(model)
         start_time = time.time()
-        self._messages.append({"role": "user", "content": text})
+        user_message = {"role": "user", "content": text}
+        if stateless:
+            request_messages = [user_message]
+        else:
+            self._messages.append(user_message)
+            request_messages = list(self._messages)
         payload = {
             "model": model_id,
-            "messages": list(self._messages),
+            "messages": request_messages,
         }
 
         try:
             response = await asyncio.to_thread(self._post_json, payload)
             response_text = self._extract_response_text(response)
         except Exception:
-            self._messages.pop()
+            if not stateless:
+                self._messages.pop()
             raise
 
-        self._messages.append({"role": "assistant", "content": response_text})
+        if not stateless:
+            self._messages.append({"role": "assistant", "content": response_text})
         elapsed_ms = int((time.time() - start_time) * 1000)
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars, "
