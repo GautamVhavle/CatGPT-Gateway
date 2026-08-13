@@ -121,7 +121,7 @@ class BearerTokenMiddleware:
     Skips auth for /docs, /openapi.json, and health-check paths.
     """
 
-    OPEN_PATHS = {b"/docs", b"/redoc", b"/openapi.json", b"/healthz"}
+    OPEN_PATHS = {b"/docs", b"/redoc", b"/openapi.json", b"/healthz", b"/preview", b"/v1/preview", b"/v1/screenshot.png"}
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -136,10 +136,12 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "").encode() if isinstance(scope.get("path"), str) else scope.get("raw_path", b"")
-        # Also check the string path for comparison
-        path_str = scope.get("path", "")
-        if path_str in {"/docs", "/redoc", "/openapi.json", "/healthz"}:
+        path_str = (scope.get("path") or "").rstrip("/")
+        if (
+            path_str in {"", "/docs", "/redoc", "/openapi.json", "/healthz", "/preview", "/v1/preview", "/v1/screenshot.png", "/favicon.ico"}
+            or path_str.startswith("/preview")
+            or path_str.startswith("/v1/screenshot")
+        ):
             await self.app(scope, receive, send)
             return
 

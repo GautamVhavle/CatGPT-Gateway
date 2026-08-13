@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from patchright.async_api import Page
 
 from src.api.openai_schemas import (
@@ -1918,4 +1918,66 @@ async def create_anthropic_message(request: Request):
                 "output_tokens": completion_tokens,
             },
         }
+
+
+@openai_router.get("/preview", response_class=HTMLResponse)
+@openai_router.get("/v1/preview", response_class=HTMLResponse)
+async def preview_page():
+    """Live browser monitor HTML page."""
+    html_content = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>CatGPT Browser Live Preview</title>
+    <style>
+        body { margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; }
+        h1 { font-size: 20px; margin-bottom: 8px; font-weight: 600; }
+        .controls { margin-bottom: 15px; display: flex; justify-content: center; align-items: center; gap: 12px; }
+        button { background: #3b82f6; color: #fff; border: none; padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+        button:hover { background: #2563eb; }
+        .container { max-width: 1200px; margin: 0 auto; background: #1e293b; padding: 10px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        img { width: 100%; height: auto; border-radius: 6px; border: 1px solid #334155; display: block; }
+        .status { font-size: 12px; color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <h1>CatGPT Gateway &mdash; Live Browser Monitor</h1>
+    <div class="controls">
+        <button onclick="refresh()">Refresh Now</button>
+        <span class="status" id="status">Auto-refreshing every 2s...</span>
+    </div>
+    <div class="container">
+        <img id="screen" src="/v1/screenshot.png" alt="Browser Screen" onerror="this.alt='Waiting for browser screenshot...'" />
+    </div>
+    <script>
+        function refresh() {
+            const img = document.getElementById('screen');
+            img.src = '/v1/screenshot.png?t=' + new Date().getTime();
+            document.getElementById('status').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
+        }
+        setInterval(refresh, 2000);
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content)
+
+
+@openai_router.get("/v1/screenshot.png")
+async def get_live_screenshot():
+    """Capture and return the current active browser page screenshot as PNG."""
+    if not _browser:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    target_page = getattr(_browser, "_page", None) or getattr(_browser, "page", None)
+    if not target_page or target_page.is_closed():
+        context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+        if context and context.pages:
+            target_page = context.pages[0]
+        else:
+            raise HTTPException(status_code=503, detail="No active browser page")
+    try:
+        screenshot_bytes = await target_page.screenshot(type="png")
+        return Response(content=screenshot_bytes, media_type="image/png")
+    except Exception as e:
+        log.error(f"Failed to capture screenshot: {e}")
+        raise HTTPException(status_code=500, detail=f"Screenshot failed: {e}")
 

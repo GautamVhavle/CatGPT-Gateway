@@ -211,16 +211,15 @@ class BrowserManager:
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
-            # Disable Chrome's built-in DNS client entirely.  Even with
-            # AsyncDns off, Chrome's stub resolver can return NXDOMAIN for
-            # domains the OS resolves fine.  We also pre-resolve domains
-            # via --host-resolver-rules (see _resolve_domains_for_chrome).
+            "--test-type",
+            # Disable Chrome's built-in DNS client entirely.
             "--disable-features=AsyncDns,DnsOverHttps",
             "--dns-prefetch-disable",
         ]
 
-        # Docker-specific flags
-        if os.path.exists("/.dockerenv") or os.environ.get("DISPLAY") == ":99":
+        # Docker or virtual display (Xvfb) flags
+        display = os.environ.get("DISPLAY", "")
+        if os.path.exists("/.dockerenv") or ":99" in display or not display:
             chrome_args.extend([
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
