@@ -66,6 +66,8 @@ def _empty_snapshot() -> dict:
         "signature": None,
         "hasCopyButton": False,
         "hasImage": False,
+        "hasStopButton": False,
+        "isStreaming": True,
         "text": "",
     }
 
@@ -111,6 +113,15 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
         () => {
             const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
 
+            const stopBtn = document.querySelector(
+                'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label*="Stop"], button[aria-label*="stop"]'
+            );
+            const hasStopButton = Boolean(stopBtn && stopBtn.offsetParent !== null);
+            const hasPageStreamingClass = Boolean(
+                document.querySelector('.result-streaming, [data-is-streaming="true"], .streaming')
+            );
+            const isPageStreaming = hasStopButton || hasPageStreamingClass;
+
             for (let idx = turns.length - 1; idx >= 0; idx--) {
                 const turn = turns[idx];
                 const turnRole = turn.getAttribute('data-turn');
@@ -124,6 +135,10 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                     turn.id ||
                     '';
 
+                const isTurnStreaming = Boolean(
+                    turn.querySelector('.result-streaming, [data-is-streaming="true"], .streaming, .result-thinking')
+                );
+
                 const hasCopyButton = Boolean(
                     turn.querySelector('button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]')
                 );
@@ -132,7 +147,8 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                     turn.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
                 );
 
-                const text = (turn.innerText || '').trim();
+                const markdownEl = turn.querySelector('[data-message-author-role="assistant"] .markdown, .markdown, .prose');
+                const text = ((markdownEl ? markdownEl.innerText : turn.innerText) || '').trim();
 
                 return {
                     found: true,
@@ -140,6 +156,8 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                     signature: `${idx}:${stableId}`,
                     hasCopyButton,
                     hasImage,
+                    hasStopButton,
+                    isStreaming: isPageStreaming || isTurnStreaming,
                     text,
                 };
             }
@@ -150,6 +168,8 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                 signature: null,
                 hasCopyButton: false,
                 hasImage: false,
+                hasStopButton,
+                isStreaming: isPageStreaming,
                 text: '',
             };
         }
@@ -345,15 +365,17 @@ async def _wait_for_copy_button_or_image(
     previous_turn_signature: str | None = None,
 ) -> str | None:
     """
-    Wait for either copy-button readiness or generated image on the latest turn.
-
-    Returns "copy", "image", or None if timed out.
+    Wait for response to truly finish generating (streaming done + copy button / stability).
     """
-    elapsed = 0
+    elapsed = 0.0
     poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
     next_heartbeat = heartbeat
     first_snapshot_logged = False
+
+    last_text = ""
+    stable_cycles = 0
+    REQUIRED_STABLE_CYCLES = 3  # Must be stable for ~1 second without streaming
 
     while elapsed * 1000 < timeout_ms:
         try:
@@ -371,50 +393,59 @@ async def _wait_for_copy_button_or_image(
         is_new_turn = previous_turn_signature is None or (
             isinstance(signature, str) and signature != previous_turn_signature
         )
+        is_streaming = bool(snapshot.get("isStreaming"))
+        text = str(snapshot.get("text") or "").strip()
+        has_copy = bool(snapshot.get("hasCopyButton"))
+        has_image = bool(snapshot.get("hasImage"))
 
         # Log the first snapshot for diagnostics
         if not first_snapshot_logged and elapsed >= 2:
             first_snapshot_logged = True
-            turn_text = (snapshot.get("text") or "")[:200]
-            all_turns = await _dump_all_turns(page)
             log.debug(
                 f"First snapshot at {int(elapsed)}s | "
                 f"prev_sig={previous_turn_signature} cur_sig={signature} "
-                f"is_new={is_new_turn} copy={snapshot.get('hasCopyButton')} "
-                f"text[:{len(turn_text)}]={turn_text!r}"
+                f"is_new={is_new_turn} streaming={is_streaming} copy={has_copy} "
+                f"text_len={len(text)}"
             )
-            log.debug(f"All turns ({len(all_turns)}): {all_turns}")
 
-        if is_new_turn and snapshot.get("hasCopyButton"):
-            log.info(
-                f"Copy button detected on latest turn {signature}"
-            )
-            return "copy"
+        if is_new_turn and text:
+            # Check text growth / stability
+            if text == last_text:
+                stable_cycles += 1
+            else:
+                stable_cycles = 0
+                last_text = text
 
-        # Use snapshot data directly instead of a separate evaluate call
-        if is_new_turn and snapshot.get("hasImage"):
-            await asyncio.sleep(0.5)
-            log.info(f"Generated image detected on latest turn {signature}")
-            return "image"
+            # Only finish if NOT streaming AND not incomplete status
+            if not is_streaming and not is_incomplete_response_text(text):
+                # If copy button is visible and text is stable for at least 2 cycles
+                if has_copy and stable_cycles >= 2:
+                    log.info(
+                        f"Response complete on turn {signature}: streaming=False, copy=True, len={len(text)}"
+                    )
+                    return "copy"
+                elif has_image and stable_cycles >= 2:
+                    await asyncio.sleep(0.5)
+                    log.info(f"Generated image detected on latest turn {signature}")
+                    return "image"
+                elif stable_cycles >= REQUIRED_STABLE_CYCLES:
+                    log.info(
+                        f"Response complete via text stability on turn {signature}: len={len(text)}"
+                    )
+                    return "copy"
+        else:
+            stable_cycles = 0
+            last_text = ""
 
         if elapsed >= next_heartbeat:
             next_heartbeat = elapsed + heartbeat
-            # Diagnostic: log what we see on the latest assistant turn
-            turn_text = (snapshot.get("text") or "")[:200]
             log.debug(
-                f"Still waiting for copy/image... ({int(elapsed)}s) | "
-                f"sig={signature} is_new={is_new_turn} "
-                f"copy={snapshot.get('hasCopyButton')} "
-                f"text[:{len(turn_text)}]={turn_text!r}"
+                f"Still generating... ({int(elapsed)}s) | "
+                f"sig={signature} streaming={is_streaming} "
+                f"stable_cycles={stable_cycles} text_len={len(text)}"
             )
-
-            # Dump all turn info for debugging
-            all_turns = await _dump_all_turns(page)
-            log.debug(f"All turns: {all_turns}")
-
             await idle_mouse_movement(page)
 
-            # Check for page-level errors every heartbeat to fail fast
             page_error = await _check_page_error(page)
             if page_error:
                 log.error(f"Page error detected while waiting: {page_error}")
@@ -430,7 +461,7 @@ async def _wait_for_copy_button_or_image(
     except Exception as e:
         log.debug(f"Could not save timeout screenshot: {e}")
 
-    log.warning(f"Neither copy button nor image found after {int(elapsed)}s")
+    log.warning(f"Neither copy button nor image completed after {int(elapsed)}s")
     return None
 
 
@@ -521,12 +552,12 @@ async def extract_last_response_via_copy(
     previous_turn_signature: str | None = None,
 ) -> str:
     """
-    Extract latest assistant response by clicking copy on the latest turn.
-
-    Never intentionally copies from previous_turn_signature when provided.
+    Extract latest assistant response by clicking copy on the latest turn,
+    falling back to DOM extraction if copy is empty or shorter than DOM text.
     """
     log.debug("Attempting extraction via latest-turn copy button...")
 
+    copy_text = ""
     try:
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
 
@@ -580,28 +611,35 @@ async def extract_last_response_via_copy(
             await asyncio.sleep(0.3)
             content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
             if content and content.strip() and content.strip() != str(pre_clipboard).strip():
+                copy_text = content.strip()
                 log.info(
                     "Extracted via copy button (latest-turn): "
-                    f"{len(content)} chars, turn={click_result.get('signature')}"
+                    f"{len(copy_text)} chars, turn={click_result.get('signature')}"
                 )
-                return content.strip()
-            log.debug("Clipboard unchanged/empty after latest-turn copy click")
-        else:
-            reason = click_result.get("reason") if isinstance(click_result, dict) else "unknown"
-            log.debug(f"Latest-turn copy click not used: {reason}")
-
     except Exception as e:
         log.warning(f"Copy button extraction failed: {e}")
 
-    log.info("Falling back to latest-turn DOM extraction...")
-    return await _extract_via_dom(page, previous_turn_signature)
+    # Extract DOM text as fallback or verification
+    dom_text = await _extract_via_dom(page, previous_turn_signature)
+
+    # Prefer whichever is longer and more complete
+    if copy_text and len(copy_text) >= len(dom_text):
+        return normalize_assistant_text(copy_text)
+    elif dom_text:
+        log.info(f"Using DOM extracted text ({len(dom_text)} chars vs copy {len(copy_text)} chars)")
+        return normalize_assistant_text(dom_text)
+    elif copy_text:
+        return normalize_assistant_text(copy_text)
+
+    log.error("Could not extract any assistant response")
+    return ""
 
 
 async def _extract_via_dom(
     page: Page,
     previous_turn_signature: str | None = None,
 ) -> str:
-    """Fallback extraction: innerText from latest assistant turn only."""
+    """Fallback extraction: text and code from latest assistant turn."""
     text = await page.evaluate(
         """
         (previousSignature) => {
@@ -623,6 +661,16 @@ async def _extract_via_dom(
 
                 if (previousSignature && signature === previousSignature) {
                     return '';
+                }
+
+                const markdownEl = turn.querySelector('[data-message-author-role="assistant"] .markdown, .markdown, .prose');
+                if (markdownEl) {
+                    const clone = markdownEl.cloneNode(true);
+                    const removeSelectors = ['button', '.sr-only'];
+                    for (const sel of removeSelectors) {
+                        clone.querySelectorAll(sel).forEach(el => el.remove());
+                    }
+                    return clone.innerText.trim();
                 }
 
                 return (turn.innerText || '').trim();

@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from src.api.openai_schemas import (
@@ -760,23 +760,124 @@ async def create_image(
         return ImagesResponse(data=image_data_list)
 
 
-@openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def _stream_chat_completion_chunks(
+    response_text: str | None,
+    tool_calls: list[ToolCall] | None,
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+):
+    """
+    Yield standard OpenAI SSE chunks for streaming /v1/chat/completions.
+    """
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created_time = int(time.time())
+
+    # 1) Initial chunk with role
+    first_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(first_chunk)}\n\n"
+
+    # 2) Text delta chunks
+    if response_text:
+        chunk_size = 20
+        for i in range(0, len(response_text), chunk_size):
+            chunk_content = response_text[i : i + chunk_size]
+            chunk_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+            await asyncio.sleep(0.005)
+
+    # 3) Tool call chunks
+    if tool_calls:
+        for idx, tc in enumerate(tool_calls):
+            tc_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": idx,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(tc_data)}\n\n"
+
+    # 4) Final chunk
+    final_finish_reason = "tool_calls" if tool_calls else "stop"
+    final_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": final_finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+
+    # 5) [DONE]
+    yield "data: [DONE]\n\n"
+
+
+@openai_router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
-) -> ChatCompletionResponse:
+):
     """
     OpenAI-compatible chat completions endpoint.
 
     Converts the message array into a single prompt, sends it to ChatGPT
     via browser automation, and returns an OpenAI-formatted response.
-    Supports tool/function calling via prompt injection.
+    Supports streaming and tool/function calling via prompt injection.
     """
     # ── Validate ────────────────────────────────────────────
-    if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported. Set stream=false or omit it.",
-        )
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
@@ -927,6 +1028,19 @@ async def create_chat_completion(
         )
 
         _increment_thread_count()
+
+        if request.stream:
+            return StreamingResponse(
+                _stream_chat_completion_chunks(
+                    response_text,
+                    tool_calls,
+                    model_id,
+                    prompt_tokens,
+                    completion_tokens,
+                ),
+                media_type="text/event-stream",
+            )
+
         return response
 
 
@@ -1468,3 +1582,138 @@ async def create_response(request: ResponsesRequest):
             )
 
         return resp.model_dump()
+
+
+@openai_router.post("/v1/messages")
+async def create_anthropic_message(request: Request):
+    """
+    Anthropic Messages API compatibility endpoint.
+    Allows Claude Code CLI and other Anthropic SDK clients to use CatGPT Gateway.
+    """
+    body = await request.json()
+    model = body.get("model", "claude-browser")
+    messages = body.get("messages", [])
+    system = body.get("system", "")
+    stream = body.get("stream", False)
+
+    chat_messages: list[ChatMessage] = []
+    if system:
+        if isinstance(system, list):
+            sys_text = "\n".join(
+                s.get("text", "") if isinstance(s, dict) else str(s)
+                for s in system
+            )
+        else:
+            sys_text = str(system)
+        chat_messages.append(ChatMessage(role="system", content=sys_text))
+
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content_str = "\n".join(text_parts)
+        else:
+            content_str = str(content)
+        chat_messages.append(ChatMessage(role=role, content=content_str))
+
+    client = _get_client()
+    model_id = _resolve_model_id(model)
+
+    async with _get_lock():
+        start_time = time.time()
+        prompt = _build_prompt(chat_messages)
+        log.info(
+            f"POST /v1/messages — model={model_id}, "
+            f"{len(messages)} messages, prompt={len(prompt)} chars"
+        )
+
+        await _ensure_fresh_chat()
+        chat_resp = await client.send_message(
+            prompt, stateless=not Config.uses_browser()
+        )
+        response_text = chat_resp.message
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        prompt_tokens = _estimate_tokens(prompt)
+        completion_tokens = _estimate_tokens(response_text)
+        _increment_thread_count()
+
+        log.info(
+            f"Anthropic Response: {elapsed_ms}ms, "
+            f"tokens≈{prompt_tokens + completion_tokens}"
+        )
+
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        if stream:
+            async def _stream_anthropic_events():
+                # 1. message_start
+                yield (
+                    "event: message_start\n"
+                    f"data: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model_id, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': prompt_tokens, 'output_tokens': 1}}})}\n\n"
+                )
+                # 2. content_block_start
+                yield (
+                    "event: content_block_start\n"
+                    f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                )
+                # 3. content_block_delta chunks
+                chunk_size = 40
+                for i in range(0, len(response_text), chunk_size):
+                    chunk = response_text[i : i + chunk_size]
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk}})}\n\n"
+                    )
+                    await asyncio.sleep(0.01)
+                # 4. content_block_stop
+                yield (
+                    "event: content_block_stop\n"
+                    f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                )
+                # 5. message_delta
+                yield (
+                    "event: message_delta\n"
+                    f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
+                )
+                # 6. message_stop
+                yield (
+                    "event: message_stop\n"
+                    f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+                )
+
+            return StreamingResponse(
+                _stream_anthropic_events(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        return {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model_id,
+            "content": [
+                {
+                    "type": "text",
+                    "text": response_text,
+                }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
+        }
+

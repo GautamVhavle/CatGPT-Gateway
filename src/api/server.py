@@ -143,13 +143,17 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Extract Authorization header
+        # Extract Authorization or x-api-key header
         headers = dict(scope.get("headers", []))
         auth_value = headers.get(b"authorization", b"").decode()
 
         provided = ""
         if auth_value.startswith("Bearer "):
             provided = auth_value[7:]
+        elif b"x-api-key" in headers:
+            provided = headers[b"x-api-key"].decode()
+        elif b"anthropic-api-key" in headers:
+            provided = headers[b"anthropic-api-key"].decode()
 
         if provided != token:
             response = JSONResponse(
