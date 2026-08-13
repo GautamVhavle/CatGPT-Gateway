@@ -2319,27 +2319,59 @@ async def preview_page():
             const tabsToShow = currentMode === 'all' ? activeTabs : activeTabs.filter(item => item.index === currentMode);
             const ts = new Date().getTime();
 
-            let html = '';
+            // 1. Remove cards that are no longer in tabsToShow
+            const neededIds = new Set(tabsToShow.map(item => `tab-card-${item.index}`));
+            Array.from(grid.children).forEach(child => {
+                if (child.id && !neededIds.has(child.id)) {
+                    grid.removeChild(child);
+                }
+            });
+
+            // 2. In-place update or create (zero innerHTML wiping = zero flicker!)
             tabsToShow.forEach(item => {
+                const cardId = `tab-card-${item.index}`;
+                let card = document.getElementById(cardId);
                 const imgSrc = `/v1/screenshot.png?tab=${item.index}&t=${ts}`;
-                html += `
-                    <div class="tab-card">
+
+                if (!card) {
+                    card = document.createElement('div');
+                    card.id = cardId;
+                    card.className = 'tab-card';
+                    card.innerHTML = `
                         <div class="card-header">
                             <div class="card-title">
                                 <span class="tag">${dict.tabPrefix}${item.index}</span>
-                                <span>${item.title || 'ChatGPT'}</span>
+                                <span class="tab-title-text">${item.title || 'ChatGPT'}</span>
                             </div>
                             <div class="card-actions">
                                 <button class="btn-close" onclick="closeTab(${item.index}, event)">${dict.closeTab}</button>
                             </div>
                         </div>
                         <div class="card-body">
-                            <img class="tab-img" src="${imgSrc}" alt="Tab ${item.index}" onclick="selectTabMode(${item.index})" />
+                            <img id="img-tab-${item.index}" class="tab-img" src="${imgSrc}" alt="Tab ${item.index}" onclick="selectTabMode(${item.index})" />
                         </div>
-                    </div>
-                `;
+                    `;
+                    grid.appendChild(card);
+                } else {
+                    // Update texts
+                    const titleEl = card.querySelector('.tab-title-text');
+                    if (titleEl && item.title) titleEl.innerText = item.title;
+                    const closeBtn = card.querySelector('.btn-close');
+                    if (closeBtn) closeBtn.innerText = dict.closeTab;
+                    const tag = card.querySelector('.tag');
+                    if (tag) tag.innerText = `${dict.tabPrefix}${item.index}`;
+
+                    // Double-buffering: Preload in background memory before updating visible img.src
+                    const visibleImg = document.getElementById(`img-tab-${item.index}`);
+                    if (visibleImg) {
+                        const tempImg = new Image();
+                        tempImg.onload = () => {
+                            visibleImg.src = tempImg.src;
+                        };
+                        tempImg.src = imgSrc;
+                    }
+                }
             });
-            grid.innerHTML = html;
         }
 
         async function closeTab(idx, e) {
