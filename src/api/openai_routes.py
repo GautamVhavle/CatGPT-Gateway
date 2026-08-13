@@ -1946,6 +1946,44 @@ async def get_open_tabs():
     return {"tabs": tabs}
 
 
+@openai_router.post("/v1/tabs/close")
+async def close_tab(tab: int = 0):
+    """Close a specific browser tab by its index."""
+    if not _browser:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context or not context.pages:
+        raise HTTPException(status_code=503, detail="No active browser pages")
+
+    if tab < 0 or tab >= len(context.pages):
+        raise HTTPException(status_code=404, detail=f"Tab {tab} not found")
+
+    target_page = context.pages[tab]
+    if len(context.pages) <= 1:
+        # Don't close the last remaining tab to preserve browser context; navigate to home
+        try:
+            await target_page.goto(Config.provider_url(), wait_until="domcontentloaded", timeout=10000)
+            return {"status": "reset", "message": "Only 1 tab remained; reset to homepage"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to reset page: {e}")
+
+    # Remove from session manager if associated
+    if _session_manager:
+        for sid, p in list(_session_manager._pages.items()):
+            if p == target_page:
+                _session_manager._pages.pop(sid, None)
+                _session_manager._session_initialized.discard(sid)
+                break
+
+    try:
+        await target_page.close()
+        log.info(f"User closed Tab #{tab} via monitor dashboard")
+        return {"status": "success", "closed_tab": tab}
+    except Exception as e:
+        log.error(f"Failed to close tab {tab}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to close tab: {e}")
+
+
 @openai_router.get("/preview", response_class=HTMLResponse)
 @openai_router.get("/v1/preview", response_class=HTMLResponse)
 async def preview_page():
@@ -1963,6 +2001,8 @@ async def preview_page():
             --border: #24324d;
             --accent: #3b82f6;
             --accent-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
             --text-main: #f1f5f9;
             --text-sub: #94a3b8;
             --success: #10b981;
@@ -2023,12 +2063,22 @@ async def preview_page():
             gap: 6px;
         }
         .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
-        .btn-outline {
-            background: transparent;
-            border: 1px solid var(--border);
-            color: var(--text-sub);
+        .btn-close {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: all 0.15s;
         }
-        .btn-outline:hover { background: var(--card-bg); color: var(--text-main); }
+        .btn-close:hover {
+            background: var(--danger);
+            color: #fff;
+            border-color: var(--danger);
+        }
         .status-badge {
             display: inline-flex;
             align-items: center;
@@ -2112,7 +2162,7 @@ async def preview_page():
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            max-width: 80%;
+            max-width: 70%;
         }
         .tag {
             font-size: 11px;
@@ -2121,6 +2171,11 @@ async def preview_page():
             padding: 2px 6px;
             border-radius: 4px;
             border: 1px solid #2563eb44;
+        }
+        .card-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
         .card-body {
             position: relative;
@@ -2210,7 +2265,9 @@ async def preview_page():
                                 <span class="tag">Tab #${t.index}</span>
                                 <span>${t.title || 'ChatGPT'}</span>
                             </div>
-                            <span style="color: #64748b; font-size: 11px;">${t.url.substring(0, 35)}...</span>
+                            <div class="card-actions">
+                                <button class="btn-close" onclick="closeTab(${t.index}, event)">✕ 关闭标签</button>
+                            </div>
                         </div>
                         <div class="card-body">
                             <img class="tab-img" src="${imgSrc}" alt="Tab ${t.index}" onclick="selectTabMode(${t.index})" />
@@ -2219,6 +2276,23 @@ async def preview_page():
                 `;
             });
             grid.innerHTML = html;
+        }
+
+        async function closeTab(idx, e) {
+            if (e) e.stopPropagation();
+            if (!confirm(`确定要关闭 Tab #${idx} 吗？`)) return;
+            try {
+                const res = await fetch(`/v1/tabs/close?tab=${idx}`, { method: 'POST' });
+                if (res.ok) {
+                    currentMode = 'all';
+                    await fetchTabs();
+                } else {
+                    const err = await res.json();
+                    alert(err.detail || '关闭失败');
+                }
+            } catch (err) {
+                alert('关闭失败: ' + err);
+            }
         }
 
         function selectTabMode(mode) {
