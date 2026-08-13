@@ -135,10 +135,6 @@ class ChatGPTClient:
         # 1. Brief pause
         await random_delay(100, 300)
 
-        # 1.5. Upload files/images if provided
-        if all_attachments:
-            await self._upload_files(all_attachments, target_page)
-
         # 2. Find the chat input
         input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input", target_page)
         if not input_selector:
@@ -149,10 +145,14 @@ class ChatGPTClient:
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message
+        # 3. Paste the message text first
         await human_type(target_page, input_selector, text)
 
-        # 4. Poll briefly for auto-submit
+        # 4. Upload files/images if provided (AFTER typing, so clear/delete doesn't wipe attachments)
+        if all_attachments:
+            await self._upload_files(all_attachments, target_page)
+
+        # 5. Poll briefly for auto-submit
         auto_submitted = False
         for _ in range(6):
             await asyncio.sleep(0.5)
@@ -170,7 +170,7 @@ class ChatGPTClient:
                 log.info("Send button not found, trying Enter key")
                 await target_page.keyboard.press("Enter")
 
-        # 5. Wait for response
+        # 6. Wait for response
         log.info("Waiting for ChatGPT response...")
         expected_count = pre_count + 1
         completed = await wait_for_response_complete(
@@ -573,33 +573,54 @@ class ChatGPTClient:
         p = page or self._page
         from pathlib import Path
         valid_paths = []
+        has_non_images = False
         for path_str in file_paths:
             path = Path(path_str)
             if path.exists() and path.is_file():
                 valid_paths.append(str(path.resolve()))
+                if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                    has_non_images = True
         if not valid_paths:
             return
 
-        file_input = None
-        for selector in Selectors.FILE_UPLOAD_INPUT:
-            try:
-                elements = await p.query_selector_all(selector)
-                if elements:
-                    file_input = elements[0]
-                    break
-            except Exception:
-                continue
+        log.info(f"Uploading {len(valid_paths)} file(s) (has_non_images={has_non_images})...")
 
-        if file_input:
-            await file_input.set_input_files(valid_paths)
+        file_inputs = await p.query_selector_all("input[type='file']")
+        target_input = None
+
+        if file_inputs:
+            if has_non_images:
+                for fi in file_inputs:
+                    accept = (await fi.get_attribute("accept") or "").lower()
+                    if "image" not in accept or "*" in accept:
+                        target_input = fi
+                        break
+            if not target_input:
+                target_input = file_inputs[0]
+
+        if target_input:
+            await target_input.set_input_files(valid_paths)
+            log.info(f"Set {len(valid_paths)} file(s) on target file input")
         else:
             try:
                 await p.set_input_files("input[type='file']", valid_paths)
+                log.info(f"Set {len(valid_paths)} file(s) via broad selector")
             except Exception as e:
                 log.error(f"Failed to upload files: {e}")
                 raise RuntimeError(f"Could not upload files: {e}")
 
-        await asyncio.sleep(3)
+        # Wait for file attachment pill/badge to appear in the composer
+        try:
+            await p.wait_for_selector(
+                "[data-testid*='attachment'], [class*='attachment'], button[aria-label*='Remove'], [data-testid*='file']",
+                timeout=8000,
+                state="attached",
+            )
+            log.info("Attachment badge detected in composer")
+        except Exception:
+            log.debug("Attachment badge wait timeout, using fallback sleep")
+
+        await asyncio.sleep(2.5)
         if len(valid_paths) > 1:
             await asyncio.sleep(len(valid_paths))
 

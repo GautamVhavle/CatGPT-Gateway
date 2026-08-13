@@ -113,9 +113,9 @@ class Selectors:
 
     # ── File / attachment upload input ────────────────────────────
     FILE_UPLOAD_INPUT = [
-        "input#upload-photos",
         "input[type='file']",
         "input[data-testid='file-upload']",
+        "input#upload-photos",
         "input[accept*='image']",
     ]
 
