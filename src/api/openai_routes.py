@@ -156,6 +156,126 @@ class BrowserPagePool:
 _page_pool: BrowserPagePool | None = None
 
 
+class PersistentSessionManager:
+    """
+    Manages persistent browser pages for sessions that require continuous conversation
+    within the same ChatGPT thread (avoiding new chat navigations and CAPTCHAs).
+    """
+
+    def __init__(self, browser: Any = None):
+        self._browser = browser
+        self._pages: dict[str, Page] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._session_initialized: set[str] = set()
+
+    def set_browser(self, browser: Any) -> None:
+        self._browser = browser
+
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._locks:
+            self._locks[session_id] = asyncio.Lock()
+        return self._locks[session_id]
+
+    @asynccontextmanager
+    async def acquire_session_page(self, session_id: str):
+        """Acquire the persistent Page bound to session_id with per-session locking."""
+        lock = self._get_lock(session_id)
+        await lock.acquire()
+        page: Page | None = None
+        try:
+            page = self._pages.get(session_id)
+            is_first_turn = session_id not in self._session_initialized
+
+            if page is None or page.is_closed():
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                elif self._browser and getattr(self._browser, "page", None):
+                    page = self._browser.page
+                else:
+                    raise RuntimeError("Browser is not running")
+
+                target_url = Config.provider_url()
+                current_url = page.url or ""
+                if target_url not in current_url:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                else:
+                    try:
+                        new_chat_btn = await page.query_selector(
+                            "a[data-testid='create-new-chat-button'], a[href='/']"
+                        )
+                        if new_chat_btn:
+                            await new_chat_btn.click()
+                            await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+
+                self._pages[session_id] = page
+                self._session_initialized.add(session_id)
+                is_first_turn = True
+
+            yield page, is_first_turn
+
+        finally:
+            lock.release()
+
+
+_session_manager: PersistentSessionManager | None = None
+
+
+def _get_session_manager() -> PersistentSessionManager:
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = PersistentSessionManager(_browser)
+    return _session_manager
+
+
+def _extract_session_id(raw_request: Request | None, body_user: str | None = None) -> str | None:
+    """Extract session ID from request headers or body user field."""
+    if raw_request is not None:
+        for header_key in ("x-session-id", "session-id", "x-thread-id", "thread-id"):
+            val = raw_request.headers.get(header_key)
+            if val and val.strip():
+                return val.strip()
+    if body_user and body_user.strip():
+        return body_user.strip()
+    return None
+
+
+def _extract_persistent_prompt(
+    messages: list[ChatMessage],
+    is_first_turn: bool,
+    has_tool_prompt: bool = False,
+) -> tuple[str, list[ChatMessage]]:
+    """
+    In persistent mode, the webpage itself remembers history.
+    If the client sent repeated full history, prune it down to the latest user message
+    (plus system prompt if first turn) to prevent prompt duplication bloat.
+    """
+    if not messages:
+        return "", []
+
+    if is_first_turn:
+        return _build_prompt(messages), messages
+
+    # Subsequent turns: Extract latest user turn (and any tool results directly associated with it)
+    latest_msgs: list[ChatMessage] = []
+    for msg in reversed(messages):
+        if msg.role in ("user", "tool"):
+            latest_msgs.insert(0, msg)
+            if msg.role == "user":
+                break
+
+    if not latest_msgs:
+        latest_msgs = [messages[-1]]
+
+    pruned_prompt = _build_prompt(latest_msgs)
+    log.info(
+        f"[Persistent Session] Pruned history: original {len(messages)} messages "
+        f"-> {len(latest_msgs)} latest message(s) ({len(pruned_prompt)} chars)"
+    )
+    return pruned_prompt, latest_msgs
+
+
 def _get_page_pool() -> BrowserPagePool:
     global _page_pool
     if _page_pool is None:
@@ -176,10 +296,11 @@ def set_openai_client(
     browser: Any = None,
 ) -> None:
     """Called by server.py to inject the client and browser."""
-    global _client, _browser, _page_pool
+    global _client, _browser, _page_pool, _session_manager
     _client = client
     _browser = browser
     _page_pool = BrowserPagePool(browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
+    _session_manager = PersistentSessionManager(browser)
 
 
 def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
@@ -903,13 +1024,14 @@ async def _stream_chat_completion_chunks(
 @openai_router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
+    raw_request: Request,
 ):
     """
     OpenAI-compatible chat completions endpoint.
 
     Converts the message array into a single prompt, sends it to ChatGPT
     via browser automation, and returns an OpenAI-formatted response.
-    Supports streaming and tool/function calling via prompt injection.
+    Supports streaming, tool/function calling, stateless execution, and persistent sessions.
     """
     # ── Validate ────────────────────────────────────────────
 
@@ -926,42 +1048,57 @@ async def create_chat_completion(
 
     client = _get_client()
     model_id = _resolve_model_id(request.model)
+    session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    async with _get_page_pool().acquire_clean_page() as page:
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
         messages = list(request.messages)
 
-        # If tools are provided, inject tool definitions as a system prompt
-        # (unless tool_choice="none", which means ignore tools)
         has_tool_prompt = False
         if request.tools and request.tool_choice != "none":
             tool_system = _build_tool_system_prompt(
                 request.tools, tool_choice=request.tool_choice
             )
-            # Prepend as the first system message
             messages.insert(0, ChatMessage(role="system", content=tool_system))
             has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        if is_persistent:
+            prompt, active_messages = _extract_persistent_prompt(
+                messages, is_first_turn, has_tool_prompt
+            )
+        else:
+            prompt = _build_prompt(messages)
+            active_messages = messages
+
         log.info(
             f"POST /v1/chat/completions — model={model_id}, "
-            f"{len(request.messages)} messages, prompt={len(prompt)} chars"
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
+            f"prompt={len(prompt)} chars"
         )
 
-        # ── Extract attachments from messages ──────────────
+        # ── Extract attachments from active messages ────────
         image_paths: list[str] = []
         file_paths: list[str] = []
-        for msg in request.messages:
+        for msg in active_messages:
             if msg.role == "user" and isinstance(msg.content, list):
-                # Images (OpenAI vision format)
                 image_urls = _extract_image_urls(msg.content)
                 for url in image_urls:
                     local_path = await _download_file(url)
                     if local_path:
                         image_paths.append(local_path)
-                # Generic file attachments
                 file_attachments = _extract_file_attachments(msg.content)
                 for fa in file_attachments:
                     local_path = await _download_file(fa)
@@ -972,14 +1109,14 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # ── Send to provider (Stateless concurrent execution) ──
+        # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
                 model=model_id,
-                stateless=True,
+                stateless=not is_persistent,
                 page=page,
             )
         except Exception as e:
@@ -1406,7 +1543,10 @@ async def _stream_response_events(
 
 
 @openai_router.post("/v1/responses")
-async def create_response(request: ResponsesRequest):
+async def create_response(
+    request: ResponsesRequest,
+    raw_request: Request,
+):
     """
     OpenAI Responses API endpoint — compatible with Codex CLI.
 
@@ -1426,8 +1566,20 @@ async def create_response(request: ResponsesRequest):
 
     client = _get_client()
     model_id = _resolve_model_id(request.model)
+    session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    async with _get_page_pool().acquire_clean_page() as page:
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
         start_time = time.time()
 
         # ── Convert input to ChatMessage list ───────────────
@@ -1453,19 +1605,25 @@ async def create_response(request: ResponsesRequest):
                 )
                 has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        if is_persistent:
+            prompt, _ = _extract_persistent_prompt(
+                messages, is_first_turn, has_tool_prompt
+            )
+        else:
+            prompt = _build_prompt(messages)
+
         log.info(
             f"POST /v1/responses — model={model_id}, "
-            f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
 
-        # ── Send to provider (Stateless concurrent execution) ──
+        # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
                 model=model_id,
-                stateless=True,
+                stateless=not is_persistent,
                 page=page,
             )
         except RuntimeError as e:
@@ -1652,17 +1810,34 @@ async def create_anthropic_message(request: Request):
 
     client = _get_client()
     model_id = _resolve_model_id(model)
+    session_id = _extract_session_id(request, body.get("user") or body.get("session_id"))
 
-    async with _get_page_pool().acquire_clean_page() as page:
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
         start_time = time.time()
-        prompt = _build_prompt(chat_messages)
+        if is_persistent:
+            prompt, _ = _extract_persistent_prompt(chat_messages, is_first_turn)
+        else:
+            prompt = _build_prompt(chat_messages)
+
         log.info(
             f"POST /v1/messages — model={model_id}, "
-            f"{len(messages)} messages, prompt={len(prompt)} chars"
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
+            f"prompt={len(prompt)} chars"
         )
 
         chat_resp = await client.send_message(
-            prompt, stateless=True, page=page
+            prompt, stateless=not is_persistent, page=page
         )
         response_text = chat_resp.message
         elapsed_ms = int((time.time() - start_time) * 1000)
