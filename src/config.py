@@ -36,9 +36,10 @@ class Config:
     LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
     IMAGES_DIR: Path = _PROJECT_ROOT / os.getenv("IMAGES_DIR", "downloads/images")
 
-    # Browser
+    # Browser & Concurrency
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
     SLOW_MO: int = int(os.getenv("SLOW_MO", "25"))
+    MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
     MINIMAX_BASE_URLS: dict[str, str] = {

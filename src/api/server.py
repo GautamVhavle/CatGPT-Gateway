@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
             _client = ChatGPTClient(page)
 
     set_client(_client, _browser)
-    set_openai_client(_client)
+    set_openai_client(_client, _browser)
     log.info(f"API server ready for {provider_name}")
 
     yield  # Server is running

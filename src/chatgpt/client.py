@@ -107,75 +107,56 @@ class ChatGPTClient:
         file_paths: list[str] | None = None,
         model: str | None = None,
         stateless: bool = False,
+        page: Page | None = None,
     ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
-
-        Args:
-            text: The message text to send.
-            image_paths: Optional list of local file paths to images to attach.
-            file_paths: Optional list of local file paths to non-image files (PDF, etc.).
-            model: Optional API model identifier. Browser selection is unchanged.
-            stateless: Accepted for provider interface compatibility; ignored.
-
-        Steps:
-        1. Simulate thinking pause
-        2. Upload images if provided
-        3. Find and focus chat input
-        4. Type message with human-like delays
-        5. Click send
-        6. Wait for response to complete
-        7. Extract and return the response
-
-        Returns ChatResponse with the assistant's reply and metadata.
         """
+        target_page = page or self._page
         all_attachments = (image_paths or []) + (file_paths or [])
         log.info(f"Sending message ({len(text)} chars, {len(all_attachments)} attachments): {text[:80]}...")
         start_time = time.time()
 
-        # 0. Check page health — recover from DNS errors before trying to send
-        page_error = await self._detect_page_error()
+        # 0. Check page health
+        page_error = await self._detect_page_error(target_page)
         if page_error:
             log.warning(f"Page error detected before send: {page_error}")
             raise RuntimeError(f"Page is in error state: {page_error}")
 
-        # 0.5 Count existing assistant messages so we know when a new one appears
-        pre_count = await count_assistant_messages(self._page)
-        pre_turn_signature = await get_latest_assistant_turn_signature(self._page)
+        # 0.5 Count existing assistant messages
+        pre_count = await count_assistant_messages(target_page)
+        pre_turn_signature = await get_latest_assistant_turn_signature(target_page)
         log.debug(f"Assistant messages before send: {pre_count}")
         log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
-        # 0.5 Check for and dismiss any blocking dialogs/overlays
-        await self._dismiss_overlays()
+        # 0.5 Dismiss blocking dialogs
+        await self._dismiss_overlays(target_page)
 
-        # 1. Brief pause (human would take a moment to start typing)
+        # 1. Brief pause
         await random_delay(100, 300)
 
         # 1.5. Upload files/images if provided
         if all_attachments:
-            await self._upload_files(all_attachments)
+            await self._upload_files(all_attachments, target_page)
 
-        # 2. Find the chat input (retry once after dismissing overlays if not found)
-        input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
+        # 2. Find the chat input
+        input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input", target_page)
         if not input_selector:
-            # An overlay may have blocked it — dismiss and retry
             log.info("Chat input not found on first try, dismissing overlays and retrying...")
-            await self._dismiss_overlays()
+            await self._dismiss_overlays(target_page)
             await asyncio.sleep(1)
-            input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
+            input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input", target_page)
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message (all at once)
-        await human_type(self._page, input_selector, text)
+        # 3. Paste the message
+        await human_type(target_page, input_selector, text)
 
-        # 4. Poll briefly for auto-submit (execCommand can trigger
-        #    f/conversation automatically in the current frontend).
-        #    If a new assistant turn appeared, skip the send button click.
+        # 4. Poll briefly for auto-submit
         auto_submitted = False
-        for _ in range(6):  # poll up to ~3s in 0.5s intervals
+        for _ in range(6):
             await asyncio.sleep(0.5)
-            post_count = await count_assistant_messages(self._page)
+            post_count = await count_assistant_messages(target_page)
             if post_count > pre_count:
                 auto_submitted = True
                 break
@@ -183,18 +164,17 @@ class ChatGPTClient:
         if auto_submitted:
             log.info("ChatGPT auto-submitted after text entry — skipping send button click")
         else:
-            # No auto-submit — click the send button
             log.info("No auto-submit detected, clicking send button")
-            sent = await self._click_send()
+            sent = await self._click_send(target_page)
             if not sent:
                 log.info("Send button not found, trying Enter key")
-                await self._page.keyboard.press("Enter")
+                await target_page.keyboard.press("Enter")
 
-        # 5. Wait for response with message count awareness
+        # 5. Wait for response
         log.info("Waiting for ChatGPT response...")
         expected_count = pre_count + 1
         completed = await wait_for_response_complete(
-            self._page,
+            target_page,
             expected_msg_count=expected_count,
             previous_turn_signature=pre_turn_signature,
         )
@@ -202,56 +182,47 @@ class ChatGPTClient:
         if not completed:
             log.warning("Response may not be complete (timeout)")
 
-        # Small buffer after completion to let DOM settle
         await asyncio.sleep(0.2)
 
-        # 6. Check for generated images in the response FIRST
-        #    (image turns have no copy button, so we must detect images
-        #    before trying copy-button extraction)
-        images = await extract_images_from_response(self._page)
+        # 6. Check for generated images
+        images = await extract_images_from_response(target_page)
         has_images = len(images) > 0
 
         # 7. Extract text content
         if has_images:
-            # Image responses don't have a copy button — extract text
-            # from the turn's DOM instead (will get the image title/desc)
-            response_text = await self._extract_image_turn_text(pre_turn_signature)
+            response_text = await self._extract_image_turn_text(pre_turn_signature, target_page)
             log.info(f"Response contains {len(images)} generated image(s)")
             for img in images:
                 log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
         else:
-            # Standard text response — use copy button (most reliable)
             response_text = await extract_last_response_via_copy(
-                self._page,
+                target_page,
                 previous_turn_signature=pre_turn_signature,
             )
 
-            # If extraction returned empty, retry a few times (DOM may not be settled)
             if not response_text.strip():
                 log.warning("Empty response extracted — retrying after short wait")
                 for retry in range(1, 4):
                     await asyncio.sleep(1.5 * retry)
                     response_text = await extract_last_response_via_copy(
-                        self._page,
+                        target_page,
                         previous_turn_signature=pre_turn_signature,
                     )
                     if response_text.strip():
                         log.info(f"Got response on extraction retry {retry}")
                         break
 
-            # If we only captured a transient status (e.g. "Pro thinking"),
-            # keep waiting and retry extraction on the same new turn.
             if is_incomplete_response_text(response_text):
                 log.warning("Extracted text looks incomplete/transient; retrying for final answer")
                 for attempt in range(1, 3):
                     await asyncio.sleep(2)
                     await wait_for_response_complete(
-                        self._page,
+                        target_page,
                         timeout_ms=90000,
                         previous_turn_signature=pre_turn_signature,
                     )
                     retry_text = await extract_last_response_via_copy(
-                        self._page,
+                        target_page,
                         previous_turn_signature=pre_turn_signature,
                     )
 
@@ -265,7 +236,7 @@ class ChatGPTClient:
                     log.warning(f"Retry {attempt} still incomplete/transient")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
-        thread_id = self._extract_thread_id()
+        thread_id = self._extract_thread_id(target_page)
 
         log.info(
             f"Response received ({elapsed_ms}ms, {len(response_text)} chars"
@@ -379,10 +350,11 @@ class ChatGPTClient:
                 continue
         log.warning("Chat input not found — page may not be fully ready")
 
-    async def _detect_page_error(self) -> str | None:
+    async def _detect_page_error(self, page: Page | None = None) -> str | None:
         """Check if the current page shows a browser or ChatGPT error."""
+        p = page or self._page
         try:
-            return await self._page.evaluate(
+            return await p.evaluate(
                 """
                 () => {
                     const body = document.body ? document.body.innerText : '';
@@ -446,14 +418,13 @@ class ChatGPTClient:
 
     # ── Private Helpers ─────────────────────────────────────────
 
-    async def _extract_image_turn_text(self, previous_turn_signature: str | None = None) -> str:
-        """
-        Extract any text content from the latest turn (for image responses).
-
-        Image turns may contain a title/description like:
-        "Creating image • Adorable orange tabby kitten close-up"
-        """
-        text = await self._page.evaluate("""
+    async def _extract_image_turn_text(
+        self,
+        previous_turn_signature: str | None = None,
+        page: Page | None = None,
+    ) -> str:
+        p = page or self._page
+        text = await p.evaluate("""
             (previousSignature) => {
                 const turns = document.querySelectorAll('section[data-testid^="conversation-turn-"]');
                 if (turns.length === 0) return '';
@@ -482,7 +453,6 @@ class ChatGPTClient:
 
                 if (!last) return '';
 
-                // Try to get descriptive text (not "ChatGPT said:" heading)
                 const spans = last.querySelectorAll('span');
                 const parts = [];
                 for (const span of spans) {
@@ -494,21 +464,22 @@ class ChatGPTClient:
                 }
                 if (parts.length > 0) return parts.join(' ');
 
-                // Fallback: full turn inner text
                 const full = (last.innerText || '').trim();
-                // Strip the "ChatGPT said:" prefix
                 return full.replace(/^ChatGPT said:\\s*/i, '').trim();
             }
         """, previous_turn_signature)
         return text or ""
 
-    async def _find_selector(self, selectors: list[str], name: str) -> str | None:
-        """
-        Try each selector in the fallback list. Return the first one that matches.
-        """
+    async def _find_selector(
+        self,
+        selectors: list[str],
+        name: str,
+        page: Page | None = None,
+    ) -> str | None:
+        p = page or self._page
         for selector in selectors:
             try:
-                el = await self._page.wait_for_selector(
+                el = await p.wait_for_selector(
                     selector,
                     timeout=Config.SELECTOR_TIMEOUT,
                     state="visible",
@@ -523,21 +494,17 @@ class ChatGPTClient:
         log.warning(f"No working selector found for: {name}")
         return None
 
-    async def _dismiss_overlays(self) -> None:
-        """Check for and dismiss any blocking dialogs/overlays on the page."""
+    async def _dismiss_overlays(self, page: Page | None = None) -> None:
+        p = page or self._page
         try:
-            result = await self._page.evaluate(
+            result = await p.evaluate(
                 """
                 () => {
                     const info = { dismissed: [], found: [] };
-
-                    // Check for role="dialog" overlays
                     const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]');
                     for (const d of dialogs) {
                         const text = (d.innerText || '').trim().substring(0, 200);
                         info.found.push('dialog: ' + text);
-
-                        // Try to find and click dismiss/close buttons
                         const closeBtn = d.querySelector(
                             'button[aria-label="Close"], button[aria-label="Dismiss"], ' +
                             'button:has(svg[data-testid="close"]), button.close'
@@ -547,8 +514,6 @@ class ChatGPTClient:
                             info.dismissed.push('dialog-close');
                         }
                     }
-
-                    // Check for "Continue generating" button
                     const allButtons = document.querySelectorAll('button');
                     for (const btn of allButtons) {
                         const btnText = (btn.innerText || '').trim().toLowerCase();
@@ -557,14 +522,6 @@ class ChatGPTClient:
                             info.dismissed.push('continue-generating');
                         }
                     }
-
-                    // Check for rate limit or error banners
-                    const banners = document.querySelectorAll('[class*="banner"], [class*="toast"], [class*="alert"]');
-                    for (const b of banners) {
-                        const text = (b.innerText || '').trim().substring(0, 200);
-                        if (text) info.found.push('banner: ' + text);
-                    }
-
                     return info;
                 }
                 """
@@ -572,15 +529,12 @@ class ChatGPTClient:
             if result and isinstance(result, dict):
                 if result.get("dismissed"):
                     log.info(f"Dismissed overlays: {result['dismissed']}")
-                if result.get("found"):
-                    log.debug(f"Page overlays found: {result['found']}")
         except Exception as e:
             log.debug(f"Overlay check failed: {e}")
 
-    async def _click_send(self) -> bool:
-        """Try to click the send button using selector fallbacks."""
-        # Check send button state before clicking
-        btn_state = await self._page.evaluate(
+    async def _click_send(self, page: Page | None = None) -> bool:
+        p = page or self._page
+        btn_state = await p.evaluate(
             """
             () => {
                 const selectors = [
@@ -604,78 +558,53 @@ class ChatGPTClient:
             }
             """
         )
-        log.debug(f"Send button state: {btn_state}")
-
-        # Don't click a disabled send button — the input wasn't recognized
         if isinstance(btn_state, dict) and btn_state.get("disabled"):
             log.warning("Send button is disabled — text may not have been inserted properly")
             return False
 
-        selector = await self._find_selector(Selectors.SEND_BUTTON, "send button")
+        selector = await self._find_selector(Selectors.SEND_BUTTON, "send button", p)
         if selector:
-            await human_click(self._page, selector)
+            await human_click(p, selector)
             log.info(f"Send button clicked via: {selector}")
             return True
         return False
 
-    async def _upload_files(self, file_paths: list[str]) -> None:
-        """
-        Upload files (images, PDFs, docs, etc.) to ChatGPT's input area.
-
-        ChatGPT has a hidden <input type="file"> that accepts various file types.
-        We set files on it directly (like drag-and-drop / file picker).
-        """
+    async def _upload_files(self, file_paths: list[str], page: Page | None = None) -> None:
+        p = page or self._page
         from pathlib import Path
-
         valid_paths = []
-        for p in file_paths:
-            path = Path(p)
+        for path_str in file_paths:
+            path = Path(path_str)
             if path.exists() and path.is_file():
                 valid_paths.append(str(path.resolve()))
-            else:
-                log.warning(f"File not found, skipping: {p}")
-
         if not valid_paths:
-            log.warning("No valid files to upload")
             return
 
-        log.info(f"Uploading {len(valid_paths)} file(s)...")
-
-        # Find the file input element — ChatGPT has a hidden <input type="file">
         file_input = None
         for selector in Selectors.FILE_UPLOAD_INPUT:
             try:
-                elements = await self._page.query_selector_all(selector)
+                elements = await p.query_selector_all(selector)
                 if elements:
                     file_input = elements[0]
-                    log.debug(f"Found file input: {selector}")
                     break
             except Exception:
                 continue
 
         if file_input:
-            # Set files directly on the input element
             await file_input.set_input_files(valid_paths)
-            log.info(f"Set {len(valid_paths)} file(s) on file input")
         else:
-            # Fallback: use page.set_input_files with a broad selector
-            log.info("No file input found via selectors, trying broad input[type=file]")
             try:
-                await self._page.set_input_files("input[type='file']", valid_paths)
-                log.info(f"Set {len(valid_paths)} file(s) via broad selector")
+                await p.set_input_files("input[type='file']", valid_paths)
             except Exception as e:
                 log.error(f"Failed to upload files: {e}")
                 raise RuntimeError(f"Could not upload files: {e}")
 
-        # Wait for files to be processed/attached (thumbnails/badges appear)
         await asyncio.sleep(3)
-        # Additional wait if multiple files
         if len(valid_paths) > 1:
             await asyncio.sleep(len(valid_paths))
-        log.info("File upload complete")
 
-    def _extract_thread_id(self) -> str:
-        """Extract the thread/conversation ID from the current URL."""
-        url = self._page.url
+    def _extract_thread_id(self, page: Page | None = None) -> str:
+        p = page or self._page
+        url = p.url
         match = re.search(r"/c/([a-f0-9-]+)", url)
         return match.group(1) if match else ""

@@ -16,10 +16,12 @@ import json
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from patchright.async_api import Page
 
 from src.api.openai_schemas import (
     ChatCompletionRequest,
@@ -54,81 +56,111 @@ log = setup_logging("openai_routes")
 
 openai_router = APIRouter()
 
-# Global reference — set by server.py at startup
+# Global references — set by server.py at startup
 _client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
-
-# Serialize all requests — single browser page, not thread-safe.
-# Created lazily to avoid Python 3.9 event-loop binding issues.
-_lock: asyncio.Lock | None = None
+_browser: Any = None
 
 
-def _get_lock() -> asyncio.Lock:
-    """Get or create the global request lock (lazy init)."""
-    global _lock
-    if _lock is None:
-        _lock = asyncio.Lock()
-    return _lock
-
-
-# Track messages in the current thread to prevent thread exhaustion
-_thread_message_count = 0
-_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
-_last_response_time: float = 0.0
-_MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
-
-
-async def _ensure_fresh_chat() -> None:
-    """Enforce cooldown between messages and start new chat if thread is full.
-
-    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
-    generating, copy-button never appears). We preemptively start a
-    new chat after _MAX_THREAD_MESSAGES to prevent this.
-
-    Also enforces a minimum gap between consecutive messages, since
-    ChatGPT's UI may not accept rapid-fire messages properly.
+class BrowserPagePool:
     """
-    global _thread_message_count, _last_response_time
+    Manages a pool of clean, stateless browser pages (tabs) for concurrent requests.
+    Each request executes in its own isolated page/tab, preventing crosstalk and prompt bloat.
+    """
 
-    # API-backed providers do not need browser cooldowns or thread rotation.
-    # Their OpenAI-compatible calls are made statelessly below because each
-    # request already carries its complete conversation history.
-    if not Config.uses_browser():
-        _thread_message_count = 0
-        return
+    def __init__(self, browser: Any = None, max_concurrency: int = 3):
+        self._browser = browser
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._pool: asyncio.Queue[Page] = asyncio.Queue()
+        self._max_concurrency = max_concurrency
 
-    # Enforce minimum gap between messages
-    if _last_response_time > 0:
-        elapsed = time.time() - _last_response_time
-        if elapsed < _MIN_MESSAGE_GAP:
-            wait = _MIN_MESSAGE_GAP - elapsed
-            log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
-            await asyncio.sleep(wait)
+    def set_browser(self, browser: Any) -> None:
+        self._browser = browser
 
-    if _thread_message_count < _MAX_THREAD_MESSAGES:
-        return  # Thread is fresh enough — no navigation needed
+    @asynccontextmanager
+    async def acquire_clean_page(self):
+        """Acquire a fresh, stateless Page ready at ChatGPT / Claude."""
+        if not Config.uses_browser():
+            yield None
+            return
 
-    client = _get_client()
-    try:
-        await client.new_chat()
-        _thread_message_count = 0
-    except Exception as e:
-        log.warning(f"new_chat() failed, retrying once: {e}")
+        await self._semaphore.acquire()
+        page: Page | None = None
+        keep_page = True
         try:
-            await asyncio.sleep(2)
-            await client.new_chat()
-            _thread_message_count = 0
-        except Exception as e2:
-            log.error(f"new_chat() retry also failed: {e2}")
-            # Don't raise — continue with current thread rather than failing
-            log.warning("Continuing with current thread despite new_chat failure")
+            # 1. Borrow from pool or create new page
+            try:
+                page = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                elif self._browser and getattr(self._browser, "page", None):
+                    page = self._browser.page
+                else:
+                    raise RuntimeError("Browser is not running")
+
+            if page is None or page.is_closed():
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                else:
+                    raise RuntimeError("Browser context unavailable")
+
+            # 2. Ensure page is at the provider URL and in a fresh chat state
+            target_url = Config.provider_url()
+            current_url = page.url or ""
+
+            if target_url not in current_url and not current_url.startswith(target_url):
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+            else:
+                try:
+                    new_chat_btn = await page.query_selector(
+                        "a[data-testid='create-new-chat-button'], a[href='/']"
+                    )
+                    if new_chat_btn:
+                        await new_chat_btn.click()
+                        await asyncio.sleep(0.3)
+                    elif current_url != f"{target_url}/" and current_url != target_url:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                except Exception as e:
+                    log.debug(f"Reset to fresh chat exception: {e}")
+
+            yield page
+
+        except Exception as e:
+            keep_page = False
+            if page and not page.is_closed():
+                main_p = getattr(self._browser, "page", None)
+                if page != main_p:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            raise e
+        finally:
+            if keep_page and page and not page.is_closed():
+                try:
+                    await self._pool.put(page)
+                except Exception:
+                    main_p = getattr(self._browser, "page", None)
+                    if page != main_p:
+                        await page.close()
+            elif page and not page.is_closed():
+                main_p = getattr(self._browser, "page", None)
+                if page != main_p:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            self._semaphore.release()
 
 
-def _increment_thread_count() -> None:
-    """Increment the thread message counter after a successful response."""
-    global _thread_message_count, _last_response_time
-    _thread_message_count += 1
-    _last_response_time = time.time()
-    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
+_page_pool: BrowserPagePool | None = None
+
+
+def _get_page_pool() -> BrowserPagePool:
+    global _page_pool
+    if _page_pool is None:
+        _page_pool = BrowserPagePool(_browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
+    return _page_pool
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -141,10 +173,13 @@ def _resolve_model_id(requested: str | None) -> str:
 
 def set_openai_client(
     client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+    browser: Any = None,
 ) -> None:
-    """Called by server.py to inject the client."""
-    global _client
+    """Called by server.py to inject the client and browser."""
+    global _client, _browser, _page_pool
     _client = client
+    _browser = browser
+    _page_pool = BrowserPagePool(browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
 
 
 def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
@@ -663,7 +698,7 @@ async def create_image(
 
     client = _get_client()
 
-    async with _get_lock():
+    async with _get_page_pool().acquire_clean_page() as page:
         start_time = time.time()
 
         # Build an image-generation prompt.
@@ -756,7 +791,6 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
-        _increment_thread_count()
         return ImagesResponse(data=image_data_list)
 
 
@@ -893,7 +927,7 @@ async def create_chat_completion(
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    async with _get_lock():
+    async with _get_page_pool().acquire_clean_page() as page:
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -938,17 +972,15 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
-
-        # ── Send to provider ───────────────────────────────
+        # ── Send to provider (Stateless concurrent execution) ──
         try:
             result = await client.send_message(
                 prompt,
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
                 model=model_id,
-                stateless=not Config.uses_browser(),
+                stateless=True,
+                page=page,
             )
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
@@ -1026,8 +1058,6 @@ async def create_chat_completion(
             f"Response: {elapsed_ms}ms, finish_reason={finish_reason}, "
             f"tokens≈{response.usage.total_tokens}"
         )
-
-        _increment_thread_count()
 
         if request.stream:
             return StreamingResponse(
@@ -1397,7 +1427,7 @@ async def create_response(request: ResponsesRequest):
     client = _get_client()
     model_id = _resolve_model_id(request.model)
 
-    async with _get_lock():
+    async with _get_page_pool().acquire_clean_page() as page:
         start_time = time.time()
 
         # ── Convert input to ChatMessage list ───────────────
@@ -1430,15 +1460,13 @@ async def create_response(request: ResponsesRequest):
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
-
-        # ── Send to provider ───────────────────────────────
+        # ── Send to provider (Stateless concurrent execution) ──
         try:
             result = await client.send_message(
                 prompt,
                 model=model_id,
-                stateless=not Config.uses_browser(),
+                stateless=True,
+                page=page,
             )
         except RuntimeError as e:
             err_msg = str(e).lower()
@@ -1625,7 +1653,7 @@ async def create_anthropic_message(request: Request):
     client = _get_client()
     model_id = _resolve_model_id(model)
 
-    async with _get_lock():
+    async with _get_page_pool().acquire_clean_page() as page:
         start_time = time.time()
         prompt = _build_prompt(chat_messages)
         log.info(
@@ -1633,9 +1661,8 @@ async def create_anthropic_message(request: Request):
             f"{len(messages)} messages, prompt={len(prompt)} chars"
         )
 
-        await _ensure_fresh_chat()
         chat_resp = await client.send_message(
-            prompt, stateless=not Config.uses_browser()
+            prompt, stateless=True, page=page
         )
         response_text = chat_resp.message
         elapsed_ms = int((time.time() - start_time) * 1000)

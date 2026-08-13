@@ -500,6 +500,18 @@ class BrowserManager:
             log.error(f"Login check error: {e}")
             return False
 
+    @property
+    def context(self) -> BrowserContext | None:
+        """Return the active browser context."""
+        return self._context
+
+    async def new_page(self) -> Page:
+        """Create a new page in the existing persistent context."""
+        if self._context is None:
+            raise RuntimeError("Browser context is not initialized")
+        page = await self._context.new_page()
+        return page
+
     async def close(self) -> None:
         """Gracefully close the browser context and playwright instance."""
         log.info("Closing browser...")
