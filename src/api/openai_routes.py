@@ -1920,42 +1920,320 @@ async def create_anthropic_message(request: Request):
         }
 
 
+@openai_router.get("/v1/tabs")
+async def get_open_tabs():
+    """Return info about all open browser tabs/pages."""
+    if not _browser:
+        return {"tabs": []}
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context:
+        return {"tabs": []}
+
+    tabs = []
+    for idx, p in enumerate(context.pages):
+        if not p.is_closed():
+            url = p.url or ""
+            title = "ChatGPT Tab"
+            try:
+                title = await asyncio.wait_for(p.title(), timeout=0.8)
+            except Exception:
+                pass
+            tabs.append({
+                "index": idx,
+                "url": url,
+                "title": title or f"Tab #{idx}",
+            })
+    return {"tabs": tabs}
+
+
 @openai_router.get("/preview", response_class=HTMLResponse)
 @openai_router.get("/v1/preview", response_class=HTMLResponse)
 async def preview_page():
-    """Live browser monitor HTML page."""
+    """Live multi-tab browser monitor dashboard."""
     html_content = """<!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
     <meta charset="utf-8">
-    <title>CatGPT Browser Live Preview</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CatGPT Gateway &mdash; Multi-Tab Live Monitor</title>
     <style>
-        body { margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; }
-        h1 { font-size: 20px; margin-bottom: 8px; font-weight: 600; }
-        .controls { margin-bottom: 15px; display: flex; justify-content: center; align-items: center; gap: 12px; }
-        button { background: #3b82f6; color: #fff; border: none; padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
-        button:hover { background: #2563eb; }
-        .container { max-width: 1200px; margin: 0 auto; background: #1e293b; padding: 10px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        img { width: 100%; height: auto; border-radius: 6px; border: 1px solid #334155; display: block; }
-        .status { font-size: 12px; color: #94a3b8; }
+        :root {
+            --bg: #0b0f19;
+            --card-bg: #151d30;
+            --border: #24324d;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --text-main: #f1f5f9;
+            --text-sub: #94a3b8;
+            --success: #10b981;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 24px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .header {
+            width: 100%;
+            max-width: 1300px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .title-area h1 {
+            font-size: 22px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: linear-gradient(135deg, #60a5fa, #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .title-area p {
+            font-size: 13px;
+            color: var(--text-sub);
+            margin-top: 4px;
+        }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .btn {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-sub);
+        }
+        .btn-outline:hover { background: var(--card-bg); color: var(--text-main); }
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-sub);
+            background: var(--card-bg);
+            padding: 6px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 8px var(--success);
+        }
+        .nav-tabs {
+            width: 100%;
+            max-width: 1300px;
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-bottom: 8px;
+            margin-bottom: 16px;
+        }
+        .tab-btn {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            color: var(--text-sub);
+            padding: 8px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s;
+        }
+        .tab-btn:hover { background: #1f2b45; color: var(--text-main); }
+        .tab-btn.active {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+            font-weight: 600;
+        }
+        .grid-container {
+            width: 100%;
+            max-width: 1300px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(580px, 1fr));
+            gap: 20px;
+        }
+        .tab-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        .tab-card:hover { border-color: #3b82f688; }
+        .card-header {
+            padding: 10px 14px;
+            background: #111827;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .card-title {
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 80%;
+        }
+        .tag {
+            font-size: 11px;
+            background: #1e293b;
+            color: #60a5fa;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #2563eb44;
+        }
+        .card-body {
+            position: relative;
+            background: #000;
+            line-height: 0;
+        }
+        .tab-img {
+            width: 100%;
+            height: auto;
+            min-height: 300px;
+            display: block;
+            object-fit: cover;
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
-    <h1>CatGPT Gateway &mdash; Live Browser Monitor</h1>
-    <div class="controls">
-        <button onclick="refresh()">Refresh Now</button>
-        <span class="status" id="status">Auto-refreshing every 2s...</span>
+    <div class="header">
+        <div class="title-area">
+            <h1>🚀 CatGPT Gateway &mdash; Live Monitor</h1>
+            <p>实时监控后台所有并发标签页与会话 (零焦点打扰模式)</p>
+        </div>
+        <div class="controls">
+            <div class="status-badge">
+                <div class="status-dot"></div>
+                <span id="tab-count-text">Scanning tabs...</span>
+            </div>
+            <button class="btn" onclick="manualRefresh()">🔄 立即刷新</button>
+        </div>
     </div>
-    <div class="container">
-        <img id="screen" src="/v1/screenshot.png" alt="Browser Screen" onerror="this.alt='Waiting for browser screenshot...'" />
+
+    <div class="nav-tabs" id="tab-bar">
+        <button class="tab-btn active" onclick="selectTabMode('all')">🔲 全部视图 (Grid)</button>
     </div>
+
+    <div class="grid-container" id="grid">
+        <!-- Tab cards rendered dynamically -->
+    </div>
+
     <script>
-        function refresh() {
-            const img = document.getElementById('screen');
-            img.src = '/v1/screenshot.png?t=' + new Date().getTime();
-            document.getElementById('status').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
+        let currentMode = 'all'; // 'all' or index number
+        let activeTabs = [];
+
+        async function fetchTabs() {
+            try {
+                const res = await fetch('/v1/tabs');
+                if (res.ok) {
+                    const data = await res.json();
+                    activeTabs = data.tabs || [];
+                    renderTabBar();
+                    renderGrid();
+                }
+            } catch (err) {
+                console.error("Failed to fetch tabs:", err);
+            }
         }
-        setInterval(refresh, 2000);
+
+        function renderTabBar() {
+            const bar = document.getElementById('tab-bar');
+            document.getElementById('tab-count-text').innerText = `${activeTabs.length} 个活跃标签页`;
+            
+            let html = `<button class="tab-btn ${currentMode === 'all' ? 'active' : ''}" onclick="selectTabMode('all')">🔲 全部标签 (${activeTabs.length})</button>`;
+            activeTabs.forEach(t => {
+                const isActive = (currentMode === t.index);
+                html += `<button class="tab-btn ${isActive ? 'active' : ''}" onclick="selectTabMode(${t.index})">📑 Tab #${t.index} ${t.index === 0 ? '(主界面)' : ''}</button>`;
+            });
+            bar.innerHTML = html;
+        }
+
+        function renderGrid() {
+            const grid = document.getElementById('grid');
+            if (activeTabs.length === 0) {
+                grid.innerHTML = '<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #64748b;">⏳ 正在等待浏览器标签页加载...</div>';
+                return;
+            }
+
+            const tabsToShow = currentMode === 'all' ? activeTabs : activeTabs.filter(t => t.index === currentMode);
+            const ts = new Date().getTime();
+
+            let html = '';
+            tabsToShow.forEach(t => {
+                const imgSrc = `/v1/screenshot.png?tab=${t.index}&t=${ts}`;
+                html += `
+                    <div class="tab-card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <span class="tag">Tab #${t.index}</span>
+                                <span>${t.title || 'ChatGPT'}</span>
+                            </div>
+                            <span style="color: #64748b; font-size: 11px;">${t.url.substring(0, 35)}...</span>
+                        </div>
+                        <div class="card-body">
+                            <img class="tab-img" src="${imgSrc}" alt="Tab ${t.index}" onclick="selectTabMode(${t.index})" />
+                        </div>
+                    </div>
+                `;
+            });
+            grid.innerHTML = html;
+        }
+
+        function selectTabMode(mode) {
+            currentMode = mode;
+            renderTabBar();
+            renderGrid();
+        }
+
+        function manualRefresh() {
+            fetchTabs();
+        }
+
+        // Initial load and periodic polling
+        fetchTabs();
+        setInterval(fetchTabs, 2500);
     </script>
 </body>
 </html>"""
@@ -1963,21 +2241,23 @@ async def preview_page():
 
 
 @openai_router.get("/v1/screenshot.png")
-async def get_live_screenshot():
-    """Capture and return the current active browser page screenshot as PNG."""
+async def get_live_screenshot(tab: int = 0):
+    """Capture and return the screenshot of the requested tab (defaults to 0)."""
     if not _browser:
         raise HTTPException(status_code=503, detail="Browser not initialized")
-    target_page = getattr(_browser, "_page", None) or getattr(_browser, "page", None)
-    if not target_page or target_page.is_closed():
-        context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
-        if context and context.pages:
-            target_page = context.pages[0]
-        else:
-            raise HTTPException(status_code=503, detail="No active browser page")
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context or not context.pages:
+        raise HTTPException(status_code=503, detail="No active browser page")
+
+    if 0 <= tab < len(context.pages) and not context.pages[tab].is_closed():
+        target_page = context.pages[tab]
+    else:
+        target_page = context.pages[0]
+
     try:
         screenshot_bytes = await target_page.screenshot(type="png")
         return Response(content=screenshot_bytes, media_type="image/png")
     except Exception as e:
-        log.error(f"Failed to capture screenshot: {e}")
+        log.error(f"Failed to capture screenshot of tab {tab}: {e}")
         raise HTTPException(status_code=500, detail=f"Screenshot failed: {e}")
 

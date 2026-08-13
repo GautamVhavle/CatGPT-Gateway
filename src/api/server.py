@@ -138,9 +138,10 @@ class BearerTokenMiddleware:
 
         path_str = (scope.get("path") or "").rstrip("/")
         if (
-            path_str in {"", "/docs", "/redoc", "/openapi.json", "/healthz", "/preview", "/v1/preview", "/v1/screenshot.png", "/favicon.ico"}
+            path_str in {"", "/docs", "/redoc", "/openapi.json", "/healthz", "/preview", "/v1/preview", "/v1/screenshot.png", "/v1/tabs", "/favicon.ico"}
             or path_str.startswith("/preview")
             or path_str.startswith("/v1/screenshot")
+            or path_str.startswith("/v1/tabs")
         ):
             await self.app(scope, receive, send)
             return
