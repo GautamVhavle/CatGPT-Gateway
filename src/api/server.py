@@ -25,6 +25,7 @@ from src.browser.manager import BrowserManager
 from src.browser.auto_login import can_prompt_for_login, ensure_logged_in
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
 from src.config import Config
 from src.api.ollama_routes import ollama_router
 from src.api.routes import router, set_client
@@ -60,66 +61,66 @@ _install_uvicorn_access_filters()
 
 # Global instances — needed for lifespan
 _browser: BrowserManager | None = None
-_client: ChatGPTClient | ClaudeClient | None = None
+_client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: launch browser. Shutdown: close it."""
+    """Initialize the active provider and release its resources on shutdown."""
     global _browser, _client
 
-    log.info("Starting browser for API server...")
-    _browser = BrowserManager()
-    page = await _browser.start()
+    Config.validate_provider()
     target_url = Config.provider_url()
-    provider_name = "Claude" if Config.PROVIDER == "claude" else "ChatGPT"
+    provider_name = Config.provider_name()
     log.info(f"Provider: {provider_name} ({target_url})")
 
-    # Navigate with retries (DNS can be slow in Docker)
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        try:
-            log.info(f"Navigation attempt {attempt}/{max_retries} to {target_url}")
-            await _browser.navigate(target_url)
-            break
-        except Exception as e:
-            log.warning(f"Navigation attempt {attempt} failed: {e}")
-            if attempt == max_retries:
-                log.error("All navigation attempts failed")
-                raise
-            wait_time = attempt * 5  # 5s, 10s, 15s, 20s
-            log.info(f"Retrying in {wait_time}s...")
-            await asyncio.sleep(wait_time)
-
-    # Apply stealth patches AFTER the first navigation.
-    # In Docker, applying stealth init scripts before navigation
-    # causes Chrome's DNS resolver to fail (ERR_NAME_NOT_RESOLVED).
-    await _browser.apply_stealth_patches()
-
-    await asyncio.sleep(3)
-
-    # ── Session info ─────────────────────────────────────────────
-    session = await _browser.get_session_info()
-
-    if not await _browser.is_logged_in():
-        log.info("Not logged in — starting auto-login flow...")
-        logged_in = await ensure_logged_in(_browser, has_session=session["exists"])
-        if not logged_in:
-            if can_prompt_for_login():
-                log.error("Login failed after auto-login attempt")
-                raise RuntimeError(f"Could not log in to {provider_name}")
-            log.warning(
-                "Login is still required, but startup is non-interactive. "
-                "API will remain online while the user signs in through noVNC/VNC."
-            )
-        else:
-            # Refresh session info after login
-            session = await _browser.get_session_info()
-
-    if Config.PROVIDER == "claude":
-        _client = ClaudeClient(page)
+    if Config.PROVIDER == "minimax":
+        _browser = None
+        _client = MiniMaxClient()
+        session = {"exists": False}
     else:
-        _client = ChatGPTClient(page)
+        log.info("Starting browser for API server...")
+        _browser = BrowserManager()
+        page = await _browser.start()
+
+        # Navigate with retries (DNS can be slow in Docker)
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                log.info(f"Navigation attempt {attempt}/{max_retries} to {target_url}")
+                await _browser.navigate(target_url)
+                break
+            except Exception as e:
+                log.warning(f"Navigation attempt {attempt} failed: {e}")
+                if attempt == max_retries:
+                    log.error("All navigation attempts failed")
+                    raise
+                wait_time = attempt * 5
+                log.info(f"Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+        await _browser.apply_stealth_patches()
+        await asyncio.sleep(3)
+        session = await _browser.get_session_info()
+
+        if not await _browser.is_logged_in():
+            log.info("Not logged in — starting auto-login flow...")
+            logged_in = await ensure_logged_in(_browser, has_session=session["exists"])
+            if not logged_in:
+                if can_prompt_for_login():
+                    log.error("Login failed after auto-login attempt")
+                    raise RuntimeError(f"Could not log in to {provider_name}")
+                log.warning(
+                    "Login is still required, but startup is non-interactive. "
+                    "API will remain online while the user signs in through noVNC/VNC."
+                )
+            else:
+                session = await _browser.get_session_info()
+
+        if Config.PROVIDER == "claude":
+            _client = ClaudeClient(page)
+        else:
+            _client = ChatGPTClient(page)
     set_client(_client, _browser)
     set_openai_client(_client)
 
@@ -203,9 +204,10 @@ async def lifespan(app: FastAPI):
 
     yield  # Server is running
 
-    log.info("Shutting down — closing browser...")
-    await _browser.close()
-    log.info("Browser closed")
+    if _browser is not None:
+        log.info("Shutting down — closing browser...")
+        await _browser.close()
+        log.info("Browser closed")
 
 
 app = FastAPI(

@@ -163,7 +163,57 @@ class _SettingClient(ChatGPTClient):
         return None
 
 
+class _AdvancedEffortClient(ChatGPTClient):
+    def __init__(self, page) -> None:
+        super().__init__(page)
+        self.actions: list[str] = []
+        self.advanced_open = False
+
+    async def _dismiss_model_picker(self) -> None:
+        self.actions.append("dismiss")
+
+    async def _detect_current_model_label(self) -> str:
+        return "Instant"
+
+    async def _open_model_picker(self, _target_label: str, current_label: str = "") -> bool:
+        self.actions.append(f"open:{current_label}")
+        return True
+
+    async def _click_menu_text(self, target_text: str) -> bool:
+        self.actions.append(f"menu:{target_text}")
+        if target_text == "Advanced":
+            self.advanced_open = True
+            return True
+        if target_text == "Effort":
+            return self.advanced_open
+        return False
+
+    async def _click_model_option(self, target_labels: tuple[str, ...]) -> bool:
+        self.actions.append(f"option:{target_labels[0]}")
+        return True
+
+
 class ChatGPTClientModelSwitchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_picker_selects_advanced_effort(self) -> None:
+        client = _AdvancedEffortClient(_FakePage())  # type: ignore[arg-type]
+        option = types.SimpleNamespace(ui_label="GPT-5.6 Sol")
+
+        with patch("src.chatgpt.client.asyncio.sleep", _noop_sleep):
+            selected = await client._ensure_advanced_effort(option, "Extra High")
+
+        self.assertTrue(selected)
+        self.assertEqual(
+            client.actions,
+            [
+                "dismiss",
+                "open:Instant",
+                "menu:Effort",
+                "menu:Advanced",
+                "menu:Effort",
+                "option:Extra High",
+            ],
+        )
+
     async def test_missing_model_option_falls_back_and_caches_when_not_strict(self) -> None:
         page = _FakePage(open_picker=True, visible_options=["GPT-5", "o3"])
         client = ChatGPTClient(page)  # type: ignore[arg-type]

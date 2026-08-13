@@ -30,8 +30,15 @@ services:
       DISPLAY_WIDTH: 1366
       DISPLAY_HEIGHT: 768
       DISPLAY_DEPTH: 24
+      # Provider: "chatgpt", "claude", or "minimax"
+      PROVIDER: ${PROVIDER:-chatgpt}
       # ChatGPT
       CHATGPT_URL: "https://chatgpt.com"
+      # MiniMax API
+      MINIMAX_REGION: ${MINIMAX_REGION:-global_en}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M2.7}
       # Timeouts
       RESPONSE_TIMEOUT: 120000
       SELECTOR_TIMEOUT: 10000

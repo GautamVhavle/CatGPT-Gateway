@@ -77,7 +77,7 @@ def _parse_model_aliases(raw: str) -> list[BrowserModelOption]:
 
 
 def _parse_model_settings(raw: str) -> dict[str, str]:
-    """Parse model setting mappings like `gpt-5.5-thinking=Extended,Pro=Standard`."""
+    """Parse effort mappings like `gpt-5.6-sol-high=High,o3=Instant`."""
     settings: dict[str, str] = {}
     for chunk in (raw or "").split(","):
         item = chunk.strip()

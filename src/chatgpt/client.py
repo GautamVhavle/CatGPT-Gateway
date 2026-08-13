@@ -359,7 +359,9 @@ class ChatGPTClient:
                 switched = await self._click_model_option(target.ui_labels)
 
         if not switched:
-            configure_opened = await self._click_menu_text("Configure")
+            configure_opened = await self._click_menu_text("Advanced")
+            if not configure_opened:
+                configure_opened = await self._click_menu_text("Configure")
             if configure_opened:
                 await asyncio.sleep(0.5)
                 switched = await self._select_model_from_configure_dialog(
@@ -1188,7 +1190,7 @@ class ChatGPTClient:
                             style.visibility !== "hidden" &&
                             style.display !== "none";
                     };
-                    const modelish = /(gpt|o[0-9]|instant|thinking|latest|model|more|configure|5\.[0-9]|4\.[0-9])/i;
+                    const modelish = /(gpt|o[0-9]|instant|medium|high|pro|effort|advanced|thinking|latest|model|more|configure|5\.[0-9]|4\.[0-9])/i;
                     const selectors = [
                         "[role='menuitemradio']",
                         "[role='menuitem']",
@@ -1240,6 +1242,8 @@ class ChatGPTClient:
             "Latest",
             "Standard",
             "Extended",
+            "Advanced",
+            "Effort",
             "Configure",
             "model",
             "GPT",
@@ -1264,7 +1268,7 @@ class ChatGPTClient:
                 const normalize = (value) =>
                     (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
                 const wanted = (hints || []).map(normalize).filter(Boolean);
-                const modelish = /(gpt|o[0-9]|instant|thinking|latest|auto|model|mini|nano|5\.[0-9]|4\.[0-9])/i;
+                const modelish = /(gpt|o[0-9]|instant|medium|high|pro|effort|advanced|thinking|latest|auto|model|mini|nano|5\.[0-9]|4\.[0-9])/i;
                 const isVisible = (el) => {
                     if (!el) return false;
                     const rect = el.getBoundingClientRect();
@@ -1443,7 +1447,10 @@ class ChatGPTClient:
         return False
 
     async def _ensure_model_setting(self, option, setting_label: str) -> bool | None:
-        """Open a model row's settings submenu and select Standard/Extended."""
+        """Open the picker and select the requested effort/legacy setting."""
+        if await self._ensure_advanced_effort(option, setting_label):
+            return True
+
         await self._dismiss_model_picker()
         current_label = await self._detect_current_model_label()
         opened = await self._open_model_picker(option.ui_label, current_label=current_label)
@@ -1489,6 +1496,28 @@ class ChatGPTClient:
 
         return False
 
+    async def _ensure_advanced_effort(self, option, setting_label: str) -> bool:
+        """Select an effort from the current Advanced -> Effort submenu."""
+        await self._dismiss_model_picker()
+        current_label = await self._detect_current_model_label()
+        opened = await self._open_model_picker(option.ui_label, current_label=current_label)
+        if not opened:
+            return False
+
+        await asyncio.sleep(0.3)
+        effort_opened = await self._click_menu_text("Effort")
+        if not effort_opened:
+            advanced_opened = await self._click_menu_text("Advanced")
+            if not advanced_opened:
+                return False
+            await asyncio.sleep(0.3)
+            effort_opened = await self._click_menu_text("Effort")
+            if not effort_opened:
+                return False
+
+        await asyncio.sleep(0.3)
+        return await self._click_model_option((setting_label,))
+
     async def _ensure_configured_model_setting(
         self,
         option,
@@ -1503,7 +1532,9 @@ class ChatGPTClient:
             return False
 
         await asyncio.sleep(0.3)
-        configure_opened = await self._click_menu_text("Configure")
+        configure_opened = await self._click_menu_text("Advanced")
+        if not configure_opened:
+            configure_opened = await self._click_menu_text("Configure")
         if not configure_opened:
             return False
 
@@ -1723,7 +1754,9 @@ class ChatGPTClient:
             return False
 
         await asyncio.sleep(0.3)
-        configure_opened = await self._click_menu_text("Configure")
+        configure_opened = await self._click_menu_text("Advanced")
+        if not configure_opened:
+            configure_opened = await self._click_menu_text("Configure")
         if not configure_opened:
             return False
 
@@ -1737,7 +1770,10 @@ class ChatGPTClient:
         return version_configured
 
     async def _click_configure_model_combobox(self) -> bool:
-        """Open the model-version combobox in ChatGPT's Configure dialog."""
+        """Open the model row in ChatGPT's Advanced/legacy Configure menu."""
+        if await self._click_menu_text("Model"):
+            return True
+
         dropdown_candidate = await self._page.evaluate(
             r"""
             () => {

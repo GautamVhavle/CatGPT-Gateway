@@ -34,6 +34,8 @@ load_dotenv(_PROJECT_ROOT / ".env")
 class Config:
     """All project settings in one place."""
 
+    SUPPORTED_PROVIDERS: tuple[str, ...] = ("chatgpt", "claude", "minimax")
+
     # Paths
     PROJECT_ROOT: Path = _PROJECT_ROOT
     BROWSER_DATA_DIR: Path = _PROJECT_ROOT / os.getenv("BROWSER_DATA_DIR", "browser_data")
@@ -47,14 +49,26 @@ class Config:
     BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "chrome").strip().lower()
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
+    MINIMAX_BASE_URLS: dict[str, str] = {
+        "global_en": "https://api.minimax.io/v1",
+        "cn_zh": "https://api.minimaxi.com/v1",
+    }
+    MINIMAX_REGION: str = os.getenv("MINIMAX_REGION", "global_en").lower()
+    MINIMAX_BASE_URL: str = (
+        os.getenv("MINIMAX_BASE_URL", "").strip()
+        or MINIMAX_BASE_URLS.get(MINIMAX_REGION, MINIMAX_BASE_URLS["global_en"])
+    ).rstrip("/")
+    MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "").strip()
+    MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M2.7",)
+    MINIMAX_MODEL: str = os.getenv("MINIMAX_MODEL", MINIMAX_MODEL_IDS[0]).strip()
     CHATGPT_DEFAULT_MODEL: str = os.getenv("CHATGPT_DEFAULT_MODEL", "")
     CHATGPT_MODEL_ALIASES: str = os.getenv(
         "CHATGPT_MODEL_ALIASES",
-        "gpt-5.5=Instant|Latest 5.5|5.5|GPT-5.5,gpt-5.5-thinking=Thinking|5.5 Thinking|Thinking 5.5|GPT-5.5 Thinking,gpt-5.5-pro=Pro|5.5 Pro|Pro 5.5|GPT-5.5 Pro,gpt-5.4=5.4|GPT-5.4|Instant 5.4,gpt-5.4-thinking=Thinking 5.4|5.4 Thinking|GPT-5.4 Thinking,gpt-5.4-pro=Pro 5.4|5.4 Pro|GPT-5.4 Pro,gpt-5.3=5.3|GPT-5.3|Instant 5.3,o3=o3",
+        "gpt-5.6-sol=GPT-5.6 Sol|5.6 Sol|Instant,gpt-5.6-sol-medium=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-extra-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-pro=GPT-5.6 Sol|5.6 Sol|Pro,gpt-5.5=GPT-5.5|5.5,gpt-5.5-thinking=GPT-5.5|5.5|Thinking|5.5 Thinking,gpt-5.5-pro=GPT-5.5|5.5|5.5 Pro,o3=o3",
     )
     CHATGPT_MODEL_SETTINGS: str = os.getenv(
         "CHATGPT_MODEL_SETTINGS",
-        "gpt-5.5-thinking=Standard,gpt-5.5-pro=Standard,gpt-5.4-thinking=Standard,gpt-5.4-pro=Standard",
+        "gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-thinking=High,gpt-5.5-pro=Pro,o3=Instant",
     )
     CHATGPT_MODEL_SWITCH_TIMEOUT: int = int(os.getenv("CHATGPT_MODEL_SWITCH_TIMEOUT", "10000"))
     CHATGPT_MODEL_SWITCH_STRICT: bool = os.getenv("CHATGPT_MODEL_SWITCH_STRICT", "false").lower() == "true"
@@ -65,7 +79,7 @@ class Config:
     OLLAMA_EMBEDDING_DIMENSIONS: int = int(os.getenv("OLLAMA_EMBEDDING_DIMENSIONS", "768"))
     OLLAMA_ACTIVE_MODEL_TTL_SECONDS: int = int(os.getenv("OLLAMA_ACTIVE_MODEL_TTL_SECONDS", "900"))
 
-    # Provider selection: "chatgpt" or "claude"
+    # Provider selection
     PROVIDER: str = os.getenv("PROVIDER", "chatgpt").lower()
 
     @classmethod
@@ -73,7 +87,96 @@ class Config:
         """Return the target URL for the active provider."""
         if cls.PROVIDER == "claude":
             return cls.CLAUDE_URL
+        if cls.PROVIDER == "minimax":
+            return cls.MINIMAX_BASE_URL
         return cls.CHATGPT_URL
+
+    @classmethod
+    def provider_name(cls) -> str:
+        """Return the display name for the active provider."""
+        names = {
+            "chatgpt": "ChatGPT",
+            "claude": "Claude",
+            "minimax": "MiniMax",
+        }
+        return names.get(cls.PROVIDER, cls.PROVIDER)
+
+    @classmethod
+    def validate_provider(cls) -> None:
+        """Validate provider-specific configuration before startup."""
+        if cls.PROVIDER not in cls.SUPPORTED_PROVIDERS:
+            supported = ", ".join(cls.SUPPORTED_PROVIDERS)
+            raise ValueError(
+                f"Unsupported provider '{cls.PROVIDER}'. Choose one of: {supported}"
+            )
+        if cls.PROVIDER == "minimax":
+            base_url_override = os.getenv("MINIMAX_BASE_URL", "").strip()
+            if (
+                cls.MINIMAX_REGION not in cls.MINIMAX_BASE_URLS
+                and not base_url_override
+            ):
+                supported = ", ".join(cls.MINIMAX_BASE_URLS)
+                raise ValueError(
+                    f"Unsupported MiniMax region '{cls.MINIMAX_REGION}'. "
+                    f"Choose one of: {supported}"
+                )
+            if cls.MINIMAX_MODEL not in cls.MINIMAX_MODEL_IDS:
+                supported = ", ".join(cls.MINIMAX_MODEL_IDS)
+                raise ValueError(
+                    f"Unsupported MiniMax model '{cls.MINIMAX_MODEL}'. "
+                    f"Choose one of: {supported}"
+                )
+
+    @classmethod
+    def uses_browser(cls) -> bool:
+        """Return whether the active provider requires browser automation."""
+        return cls.PROVIDER != "minimax"
+
+    @classmethod
+    def provider_model_ids(cls) -> tuple[str, ...]:
+        """Return model IDs exposed by the active provider."""
+        if cls.PROVIDER == "claude":
+            return ("claude-browser",)
+        if cls.PROVIDER == "minimax":
+            return cls.MINIMAX_MODEL_IDS
+        return ("catgpt-browser",)
+
+    @classmethod
+    def default_model_id(cls) -> str:
+        """Return the default model ID for the active provider."""
+        if cls.PROVIDER == "minimax":
+            return cls.MINIMAX_MODEL
+        return cls.provider_model_ids()[0]
+
+    @classmethod
+    def resolve_model_id(cls, requested: str | None) -> str:
+        """Resolve request defaults and validate MiniMax model IDs."""
+        if cls.PROVIDER != "minimax":
+            return requested or cls.default_model_id()
+
+        if not requested or requested in {"catgpt-browser", "claude-browser"}:
+            return cls.MINIMAX_MODEL
+        if requested not in cls.MINIMAX_MODEL_IDS:
+            supported = ", ".join(cls.MINIMAX_MODEL_IDS)
+            raise ValueError(
+                f"Unsupported MiniMax model '{requested}'. Choose one of: {supported}"
+            )
+        return requested
+
+    @classmethod
+    def provider_owner(cls) -> str:
+        """Return the owner label used by the models endpoint."""
+        owners = {
+            "chatgpt": "catgpt",
+            "claude": "anthropic",
+            "minimax": "minimax",
+        }
+        return owners.get(cls.PROVIDER, cls.PROVIDER)
+
+    @classmethod
+    def supports_image_generation(cls) -> bool:
+        """Return whether the active provider supports the image route."""
+        return cls.PROVIDER == "chatgpt"
 
     # Timeouts (ms)
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))

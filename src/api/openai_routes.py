@@ -59,6 +59,7 @@ from src.api.attachment_expander import (
 from src.api.browser_gate import browser_access_lock
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
 from src.chatgpt.model_registry import (
     PUBLIC_BROWSER_MODEL_ID,
     is_supported_chat_model,
@@ -72,8 +73,13 @@ log = setup_logging("openai_routes")
 openai_router = APIRouter()
 
 # Global reference - set by server.py at startup
-BrowserClient = ChatGPTClient | ClaudeClient
-_client: BrowserClient | None = None
+ProviderClient = ChatGPTClient | ClaudeClient | MiniMaxClient
+_client: ProviderClient | None = None
+
+# Kept for compatibility with integrations that reset the legacy route state.
+_lock: asyncio.Lock | None = None
+_thread_message_count = 0
+_last_response_time = 0.0
 
 _jobs_lock = asyncio.Lock()
 _jobs: dict[str, ChatCompletionJobResponse] = {}
@@ -114,15 +120,15 @@ _thread_title_lock = asyncio.Lock()
 _thread_titles: dict[str, tuple[float, str]] = {}
 
 
-def set_openai_client(client: BrowserClient) -> None:
-    """Called by server.py to inject the ChatGPT client."""
+def set_openai_client(client: ProviderClient) -> None:
+    """Called by server.py to inject the active provider client."""
     global _client
     _client = client
 
 
-def _get_client() -> BrowserClient:
+def _get_client() -> ProviderClient:
     if _client is None:
-        raise HTTPException(status_code=503, detail="ChatGPT client not initialized")
+        raise HTTPException(status_code=503, detail="Provider client not initialized")
     return _client
 
 
@@ -674,6 +680,17 @@ def _extract_file_attachments(content) -> list[dict]:
         if data_b64:
             files.append({"filename": filename, "data_b64": data_b64, "mime_type": mime_type})
     return files
+
+
+def _contains_attachment(content) -> bool:
+    """Return whether OpenAI chat/responses content contains an attachment."""
+    if isinstance(content, list):
+        return any(_contains_attachment(item) for item in content)
+    if not isinstance(content, dict):
+        return False
+    if content.get("type") in {"image_url", "file", "input_image", "input_file"}:
+        return True
+    return any(_contains_attachment(value) for value in content.values())
 
 
 async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catgpt_files") -> str | None:
@@ -1409,22 +1426,44 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
             detail="page_extraction.mode='structured' manages response_format automatically. Omit response_format.",
         )
 
-    if not is_supported_chat_model(request.model):
+    if Config.PROVIDER == "minimax" and any(
+        _contains_attachment(message.content) for message in request.messages
+    ):
+        raise HTTPException(
+            status_code=501,
+            detail="Attachments are not supported by the MiniMax provider.",
+        )
+
+    _resolve_model_id(request.model)
+
+
+def _resolve_model_id(requested: str | None) -> str:
+    """Resolve and validate a model ID for the active provider."""
+    if Config.PROVIDER == "minimax":
+        try:
+            return Config.resolve_model_id(requested)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not is_supported_chat_model(requested):
         supported = ", ".join(list_public_chat_models())
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported model '{request.model}'. Supported models: {supported}",
+            detail=f"Unsupported model '{requested}'. Supported models: {supported}",
         )
+    return requested or Config.default_model_id()
 
 
 def _resolve_app_key(
     request: ChatCompletionRequest,
-    http_request: Request,
+    http_request: Request | None,
     endpoint_app_name: str = "",
 ) -> str:
     """Resolve app key when app-thread mode is enabled."""
     if not Config.API_APP_THREAD_MODE:
         return ""
+    if http_request is None:
+        return (endpoint_app_name or "").strip()
     return _derive_app_key(request, http_request, endpoint_app_name=endpoint_app_name)
 
 
@@ -1593,7 +1632,14 @@ async def _execute_image_generation(
 
 @openai_router.get("/v1/models", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
-    """List available browser-backed chat model ids."""
+    """List model IDs exposed by the active provider."""
+    if Config.PROVIDER == "minimax":
+        return ModelListResponse(
+            data=[
+                ModelObject(id=model_id, owned_by=Config.provider_owner())
+                for model_id in Config.provider_model_ids()
+            ]
+        )
     return ModelListResponse(
         data=[ModelObject(id=model_id, owned_by="catgpt") for model_id in list_public_chat_models()]
     )
@@ -1630,7 +1676,7 @@ async def create_image_scoped(
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(
     request: ChatCompletionRequest,
-    http_request: Request,
+    http_request: Request = None,
 ) -> ChatCompletionResponse:
     """
     OpenAI-compatible chat completions endpoint.
@@ -1953,12 +1999,7 @@ def _validate_responses_request(request: ResponsesRequest) -> None:
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
-    if not is_supported_chat_model(request.model):
-        supported = ", ".join(list_public_chat_models())
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported model '{request.model}'. Supported models: {supported}",
-        )
+    _resolve_model_id(request.model)
 
 
 async def _execute_responses(
@@ -1981,6 +2022,7 @@ async def _execute_chat_completion(
 ) -> ChatCompletionResponse:
     """Shared sync/async executor for chat completions."""
     client = _get_client()
+    model_id = _resolve_model_id(request.model)
 
     # Track expired thread ids to delete *after* releasing browser_access_lock.
     # Deletion must run under the lock itself, so we cannot inline it while this
@@ -2114,7 +2156,8 @@ async def _execute_chat_completion(
             prompt = full_prompt
             used_thread_contract = False
             used_user_contract = False
-            current_thread_id = client._extract_thread_id()
+            extract_thread_id = getattr(client, "_extract_thread_id", None)
+            current_thread_id = extract_thread_id() if callable(extract_thread_id) else ""
             current_chat_name = await _lookup_thread_title(client, current_thread_id) if current_thread_id else ""
             chat_display = current_chat_name or ("New chat" if not current_thread_id else "Unknown")
             log.info(
@@ -2211,13 +2254,16 @@ async def _execute_chat_completion(
 
             # -- Send to ChatGPT --------------------------------
             try:
-                result = await client.send_message(
-                    prompt,
-                    image_paths=image_paths or None,
-                    file_paths=file_paths or None,
-                    model=request.model,
-                    read_aloud=bool(request.read_aloud),
-                )
+                send_kwargs = {
+                    "image_paths": image_paths or None,
+                    "file_paths": file_paths or None,
+                    "model": model_id,
+                }
+                if Config.uses_browser():
+                    send_kwargs["read_aloud"] = bool(request.read_aloud)
+                else:
+                    send_kwargs["stateless"] = True
+                result = await client.send_message(prompt, **send_kwargs)
             except Exception as e:
                 log.error(f"ChatGPT error: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"ChatGPT error: {str(e)}")
@@ -2266,7 +2312,7 @@ async def _execute_chat_completion(
                         full_prompt,
                         image_paths=image_paths or None,
                         file_paths=file_paths or None,
-                        model=request.model,
+                        model=model_id,
                     )
                     response_text = full_retry.message
                     elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2330,7 +2376,7 @@ async def _execute_chat_completion(
                             retry_prompt,
                             image_paths=image_paths or None,
                             file_paths=file_paths or None,
-                            model=request.model,
+                            model=model_id,
                         )
                         retry_text = retry_result.message
                         retry_text = _normalize_structured_content(retry_text, effective_response_format)
@@ -2363,7 +2409,7 @@ async def _execute_chat_completion(
             completion_tokens = _estimate_tokens(response_text or "")
 
             response = ChatCompletionResponse(
-                model=request.model,
+                model=model_id,
                 choices=[
                     Choice(
                         index=0,

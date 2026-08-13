@@ -27,6 +27,8 @@ from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
 from src.chatgpt.model_registry import is_supported_chat_model, list_public_chat_models
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
+from src.config import Config
 from src.log import setup_logging
 
 log = setup_logging("api_routes")
@@ -34,12 +36,15 @@ log = setup_logging("api_routes")
 router = APIRouter()
 
 # Global reference — set by the server on startup
-_client: ChatGPTClient | ClaudeClient | None = None
+_client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 _browser: BrowserManager | None = None
 
 
-def set_client(client: ChatGPTClient | ClaudeClient, browser: BrowserManager) -> None:
-    """Called by server.py to inject the active browser client instance."""
+def set_client(
+    client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+    browser: BrowserManager | None,
+) -> None:
+    """Called by server.py to inject the active provider client instance."""
     global _client, _browser
     _client = client
     _browser = browser
@@ -83,6 +88,12 @@ def _build_response(result) -> ChatResponse:
 
 def _validate_model(model: str | None) -> None:
     """Reject unsupported browser model ids early for the native REST routes."""
+    if Config.PROVIDER == "minimax":
+        try:
+            Config.resolve_model_id(model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return
     if not model:
         return
     if is_supported_chat_model(model):
@@ -195,7 +206,7 @@ async def status() -> StatusResponse:
     try:
         client = _get_client()
         async with browser_access_lock:
-            logged_in = await _browser.is_logged_in()
+            logged_in = True if _browser is None else await _browser.is_logged_in()
             tid = client._extract_thread_id()
             return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)
     except Exception:

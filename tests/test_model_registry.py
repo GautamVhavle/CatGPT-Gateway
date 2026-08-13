@@ -14,24 +14,20 @@ class ModelRegistryTests(unittest.TestCase):
                 ["catgpt-browser", "gpt-5.3", "o3"],
             )
 
-    def test_default_models_include_pro_composer_latest_alias(self) -> None:
+    def test_default_models_match_current_advanced_picker(self) -> None:
+        self.assertIn("gpt-5.6-sol", model_registry.list_public_chat_models())
+        self.assertIn("gpt-5.6-sol-medium", model_registry.list_public_chat_models())
+        self.assertIn("gpt-5.6-sol-high", model_registry.list_public_chat_models())
+        self.assertIn("gpt-5.6-sol-extra-high", model_registry.list_public_chat_models())
+        self.assertIn("gpt-5.6-sol-pro", model_registry.list_public_chat_models())
         self.assertIn("gpt-5.5", model_registry.list_public_chat_models())
         self.assertIn("gpt-5.5-thinking", model_registry.list_public_chat_models())
         self.assertIn("gpt-5.5-pro", model_registry.list_public_chat_models())
-        self.assertIn("gpt-5.4", model_registry.list_public_chat_models())
-        self.assertIn("gpt-5.4-thinking", model_registry.list_public_chat_models())
-        self.assertIn("gpt-5.4-pro", model_registry.list_public_chat_models())
-        self.assertIn("gpt-5.3", model_registry.list_public_chat_models())
         self.assertIn("o3", model_registry.list_public_chat_models())
-        self.assertNotIn("gpt-5.2", model_registry.list_public_chat_models())
-        self.assertNotIn("gpt-5.1", model_registry.list_public_chat_models())
-        self.assertNotIn("gpt-4o", model_registry.list_public_chat_models())
         self.assertTrue(model_registry.is_supported_chat_model("Instant"))
         self.assertTrue(model_registry.is_supported_chat_model("Thinking"))
         self.assertTrue(model_registry.is_supported_chat_model("Pro"))
-        self.assertTrue(model_registry.is_supported_chat_model("Thinking 5.4"))
-        self.assertTrue(model_registry.is_supported_chat_model("Pro 5.4"))
-        self.assertTrue(model_registry.is_supported_chat_model("Latest 5.5"))
+        self.assertTrue(model_registry.is_supported_chat_model("GPT-5.6 Sol"))
         self.assertTrue(model_registry.is_supported_chat_model("5.5"))
         self.assertTrue(model_registry.is_supported_chat_model("GPT-5.5"))
 

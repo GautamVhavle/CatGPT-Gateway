@@ -127,30 +127,30 @@ CatGPT exposes `catgpt-browser` plus the configured ChatGPT picker models. The
 model switcher is driven by `CHATGPT_MODEL_ALIASES` and
 `CHATGPT_MODEL_SETTINGS`, so you can update labels when ChatGPT changes the UI.
 
-| API model id | ChatGPT picker target | Accepted aliases | Standard / Extended setting |
+| API model id | Advanced model | Effort | Accepted aliases |
 | --- | --- | --- | --- |
-| `catgpt-browser` | Current browser model, or `CHATGPT_DEFAULT_MODEL` when set | `auto`, `default`, `browser` | No |
-| `gpt-5.5` | Instant / latest 5.5 | `Instant`, `Latest 5.5`, `5.5`, `GPT-5.5` | No |
-| `gpt-5.5-thinking` | Thinking on 5.5 | `Thinking`, `5.5 Thinking`, `Thinking 5.5`, `GPT-5.5 Thinking` | Yes |
-| `gpt-5.5-pro` | Pro on 5.5 | `Pro`, `5.5 Pro`, `Pro 5.5`, `GPT-5.5 Pro` | Yes |
-| `gpt-5.4` | 5.4 / Instant 5.4 | `5.4`, `GPT-5.4`, `Instant 5.4` | No |
-| `gpt-5.4-thinking` | Thinking on 5.4 | `Thinking 5.4`, `5.4 Thinking`, `GPT-5.4 Thinking` | Yes |
-| `gpt-5.4-pro` | Pro on 5.4 | `Pro 5.4`, `5.4 Pro`, `GPT-5.4 Pro` | Yes |
-| `gpt-5.3` | 5.3 / Instant 5.3 | `5.3`, `GPT-5.3`, `Instant 5.3` | No |
-| `o3` | o3 | `o3` | No |
+| `catgpt-browser` | Current selection, or `CHATGPT_DEFAULT_MODEL` when set | Current | `auto`, `default`, `browser` |
+| `gpt-5.6-sol` | GPT-5.6 Sol | Instant | `GPT-5.6 Sol`, `5.6 Sol`, `Instant` |
+| `gpt-5.6-sol-medium` | GPT-5.6 Sol | Medium | `GPT-5.6 Sol`, `5.6 Sol` |
+| `gpt-5.6-sol-high` | GPT-5.6 Sol | High | `GPT-5.6 Sol`, `5.6 Sol` |
+| `gpt-5.6-sol-extra-high` | GPT-5.6 Sol | Extra High | `GPT-5.6 Sol`, `5.6 Sol` |
+| `gpt-5.6-sol-pro` | GPT-5.6 Sol | Pro | `GPT-5.6 Sol`, `5.6 Sol`, `Pro` |
+| `gpt-5.5` | GPT-5.5 | Instant | `GPT-5.5`, `5.5` |
+| `gpt-5.5-thinking` | GPT-5.5 | High | `Thinking`, `5.5 Thinking` |
+| `gpt-5.5-pro` | GPT-5.5 | Pro | `5.5 Pro` |
+| `o3` | o3 | Instant | `o3` |
 
 Default configurable settings:
 
 ```env
-CHATGPT_MODEL_SETTINGS=gpt-5.5-thinking=Standard,gpt-5.5-pro=Standard,gpt-5.4-thinking=Standard,gpt-5.4-pro=Standard
+CHATGPT_MODEL_SETTINGS=gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-thinking=High,gpt-5.5-pro=Pro,o3=Instant
 ```
 
-Example: default all `catgpt-browser` requests to 5.4 Thinking Extended.
+Example: default all `catgpt-browser` requests to GPT-5.6 Sol with High effort.
 
 ```yaml
 environment:
-  CHATGPT_DEFAULT_MODEL: "gpt-5.4-thinking"
-  CHATGPT_MODEL_SETTINGS: "gpt-5.4-thinking=Extended"
+  CHATGPT_DEFAULT_MODEL: "gpt-5.6-sol-high"
 ```
 
 ## Docker Environment Variables
@@ -184,8 +184,8 @@ environment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CHATGPT_DEFAULT_MODEL` | empty | Model to use when a request asks for `catgpt-browser`, `auto`, or `default`. |
-| `CHATGPT_MODEL_ALIASES` | Current 5.5, 5.4, 5.3, and o3 aliases | Comma-separated `model=label|alias` map for ChatGPT UI labels. |
-| `CHATGPT_MODEL_SETTINGS` | Thinking/Pro set to `Standard` | Comma-separated setting map for Thinking/Pro rows. |
+| `CHATGPT_MODEL_ALIASES` | Current GPT-5.6 Sol, GPT-5.5, and o3 aliases | Comma-separated `model=label|alias` map for Advanced → Model choices. |
+| `CHATGPT_MODEL_SETTINGS` | Instant/Medium/High/Extra High/Pro mappings | Comma-separated effort map used through Advanced → Effort. |
 | `CHATGPT_MODEL_SWITCH_TIMEOUT` | `10000` | Milliseconds to wait for a model label after switching. |
 | `CHATGPT_MODEL_SWITCH_STRICT` | `false` | Return an error when a configured model is not visible instead of continuing. |
 
