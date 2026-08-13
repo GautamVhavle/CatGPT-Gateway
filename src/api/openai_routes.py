@@ -1987,13 +1987,13 @@ async def close_tab(tab: int = 0):
 @openai_router.get("/preview", response_class=HTMLResponse)
 @openai_router.get("/v1/preview", response_class=HTMLResponse)
 async def preview_page():
-    """Live multi-tab browser monitor dashboard."""
+    """Live multi-tab browser monitor dashboard with i18n support."""
     html_content = """<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CatGPT Gateway &mdash; Multi-Tab Live Monitor</title>
+    <title>CatGPT Gateway &mdash; Live Monitor</title>
     <style>
         :root {
             --bg: #0b0f19;
@@ -2063,6 +2063,12 @@ async def preview_page():
             gap: 6px;
         }
         .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+        .btn-outline {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+        .btn-outline:hover { background: #1f2b45; }
         .btn-close {
             background: rgba(239, 68, 68, 0.15);
             border: 1px solid rgba(239, 68, 68, 0.3);
@@ -2195,20 +2201,21 @@ async def preview_page():
 <body>
     <div class="header">
         <div class="title-area">
-            <h1>🚀 CatGPT Gateway &mdash; Live Monitor</h1>
-            <p>实时监控后台所有并发标签页与会话 (零焦点打扰模式)</p>
+            <h1 id="ui-title">🚀 CatGPT Gateway &mdash; Live Monitor</h1>
+            <p id="ui-subtitle">Real-time monitoring of all background tabs & concurrent sessions (Zero focus interruption)</p>
         </div>
         <div class="controls">
+            <button class="btn btn-outline" onclick="toggleLanguage()" id="lang-btn">🌐 Language</button>
             <div class="status-badge">
                 <div class="status-dot"></div>
                 <span id="tab-count-text">Scanning tabs...</span>
             </div>
-            <button class="btn" onclick="manualRefresh()">🔄 立即刷新</button>
+            <button class="btn" onclick="manualRefresh()" id="ui-refresh-btn">🔄 Refresh</button>
         </div>
     </div>
 
     <div class="nav-tabs" id="tab-bar">
-        <button class="tab-btn active" onclick="selectTabMode('all')">🔲 全部视图 (Grid)</button>
+        <!-- Rendered dynamically -->
     </div>
 
     <div class="grid-container" id="grid">
@@ -2216,8 +2223,63 @@ async def preview_page():
     </div>
 
     <script>
-        let currentMode = 'all'; // 'all' or index number
+        const i18n = {
+            zh: {
+                title: "🚀 CatGPT Gateway — 实时监控看板",
+                subtitle: "实时监控后台所有并发标签页与会话 (零焦点打扰模式)",
+                scanning: "正在扫描标签页...",
+                activeTabsSuffix: " 个活跃标签页",
+                refreshBtn: "🔄 立即刷新",
+                allTabs: "🔲 全部视图 (Grid)",
+                tabPrefix: "Tab #",
+                mainSuffix: " (主界面)",
+                closeTab: "✕ 关闭标签",
+                closeConfirm: "确定要关闭 Tab #{idx} 吗？",
+                closeFailed: "关闭失败: ",
+                waiting: "⏳ 正在等待浏览器标签页加载...",
+                langBtn: "🌐 English"
+            },
+            en: {
+                title: "🚀 CatGPT Gateway — Live Monitor",
+                subtitle: "Real-time monitoring of background tabs & sessions (Zero focus interruption)",
+                scanning: "Scanning tabs...",
+                activeTabsSuffix: " active tab(s)",
+                refreshBtn: "🔄 Refresh",
+                allTabs: "🔲 All Tabs (Grid)",
+                tabPrefix: "Tab #",
+                mainSuffix: " (Main)",
+                closeTab: "✕ Close Tab",
+                closeConfirm: "Are you sure you want to close Tab #{idx}?",
+                closeFailed: "Failed to close tab: ",
+                waiting: "⏳ Waiting for browser tabs to initialize...",
+                langBtn: "🌐 中文"
+            }
+        };
+
+        const detectedLang = (navigator.language || navigator.userLanguage || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+        let currentLang = localStorage.getItem('catgpt_lang') || detectedLang;
+        let currentMode = 'all';
         let activeTabs = [];
+
+        function t() {
+            return i18n[currentLang] || i18n.en;
+        }
+
+        function updateStaticTexts() {
+            const dict = t();
+            document.getElementById('ui-title').innerText = dict.title;
+            document.getElementById('ui-subtitle').innerText = dict.subtitle;
+            document.getElementById('ui-refresh-btn').innerText = dict.refreshBtn;
+            document.getElementById('lang-btn').innerText = dict.langBtn;
+        }
+
+        function toggleLanguage() {
+            currentLang = currentLang === 'zh' ? 'en' : 'zh';
+            localStorage.setItem('catgpt_lang', currentLang);
+            updateStaticTexts();
+            renderTabBar();
+            renderGrid();
+        }
 
         async function fetchTabs() {
             try {
@@ -2234,43 +2296,45 @@ async def preview_page():
         }
 
         function renderTabBar() {
+            const dict = t();
             const bar = document.getElementById('tab-bar');
-            document.getElementById('tab-count-text').innerText = `${activeTabs.length} 个活跃标签页`;
+            document.getElementById('tab-count-text').innerText = `${activeTabs.length} ${dict.activeTabsSuffix}`;
             
-            let html = `<button class="tab-btn ${currentMode === 'all' ? 'active' : ''}" onclick="selectTabMode('all')">🔲 全部标签 (${activeTabs.length})</button>`;
-            activeTabs.forEach(t => {
-                const isActive = (currentMode === t.index);
-                html += `<button class="tab-btn ${isActive ? 'active' : ''}" onclick="selectTabMode(${t.index})">📑 Tab #${t.index} ${t.index === 0 ? '(主界面)' : ''}</button>`;
+            let html = `<button class="tab-btn ${currentMode === 'all' ? 'active' : ''}" onclick="selectTabMode('all')">${dict.allTabs} (${activeTabs.length})</button>`;
+            activeTabs.forEach(item => {
+                const isActive = (currentMode === item.index);
+                html += `<button class="tab-btn ${isActive ? 'active' : ''}" onclick="selectTabMode(${item.index})">📑 ${dict.tabPrefix}${item.index}${item.index === 0 ? dict.mainSuffix : ''}</button>`;
             });
             bar.innerHTML = html;
         }
 
         function renderGrid() {
+            const dict = t();
             const grid = document.getElementById('grid');
             if (activeTabs.length === 0) {
-                grid.innerHTML = '<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #64748b;">⏳ 正在等待浏览器标签页加载...</div>';
+                grid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #64748b;">${dict.waiting}</div>`;
                 return;
             }
 
-            const tabsToShow = currentMode === 'all' ? activeTabs : activeTabs.filter(t => t.index === currentMode);
+            const tabsToShow = currentMode === 'all' ? activeTabs : activeTabs.filter(item => item.index === currentMode);
             const ts = new Date().getTime();
 
             let html = '';
-            tabsToShow.forEach(t => {
-                const imgSrc = `/v1/screenshot.png?tab=${t.index}&t=${ts}`;
+            tabsToShow.forEach(item => {
+                const imgSrc = `/v1/screenshot.png?tab=${item.index}&t=${ts}`;
                 html += `
                     <div class="tab-card">
                         <div class="card-header">
                             <div class="card-title">
-                                <span class="tag">Tab #${t.index}</span>
-                                <span>${t.title || 'ChatGPT'}</span>
+                                <span class="tag">${dict.tabPrefix}${item.index}</span>
+                                <span>${item.title || 'ChatGPT'}</span>
                             </div>
                             <div class="card-actions">
-                                <button class="btn-close" onclick="closeTab(${t.index}, event)">✕ 关闭标签</button>
+                                <button class="btn-close" onclick="closeTab(${item.index}, event)">${dict.closeTab}</button>
                             </div>
                         </div>
                         <div class="card-body">
-                            <img class="tab-img" src="${imgSrc}" alt="Tab ${t.index}" onclick="selectTabMode(${t.index})" />
+                            <img class="tab-img" src="${imgSrc}" alt="Tab ${item.index}" onclick="selectTabMode(${item.index})" />
                         </div>
                     </div>
                 `;
@@ -2279,8 +2343,9 @@ async def preview_page():
         }
 
         async function closeTab(idx, e) {
+            const dict = t();
             if (e) e.stopPropagation();
-            if (!confirm(`确定要关闭 Tab #${idx} 吗？`)) return;
+            if (!confirm(dict.closeConfirm.replace('{idx}', idx))) return;
             try {
                 const res = await fetch(`/v1/tabs/close?tab=${idx}`, { method: 'POST' });
                 if (res.ok) {
@@ -2288,10 +2353,10 @@ async def preview_page():
                     await fetchTabs();
                 } else {
                     const err = await res.json();
-                    alert(err.detail || '关闭失败');
+                    alert(err.detail || (dict.closeFailed + res.status));
                 }
             } catch (err) {
-                alert('关闭失败: ' + err);
+                alert(dict.closeFailed + err);
             }
         }
 
@@ -2305,7 +2370,8 @@ async def preview_page():
             fetchTabs();
         }
 
-        // Initial load and periodic polling
+        // Initialize i18n and data fetching
+        updateStaticTexts();
         fetchTabs();
         setInterval(fetchTabs, 2500);
     </script>
