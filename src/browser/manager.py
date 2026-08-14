@@ -215,6 +215,14 @@ class BrowserManager:
             # Disable Chrome's built-in DNS client entirely.
             "--disable-features=AsyncDns,DnsOverHttps",
             "--dns-prefetch-disable",
+            # Suppress "Restore pages?" crash-recovery popup and force
+            # Chrome NOT to restore the previous session on any restart.
+            # This prevents the browser from stealing focus by showing the
+            # restore dialog after a server/agent crash.
+            "--hide-crash-restore-bubble",
+            "--restore-last-session=0",
+            "--disable-session-crashed-bubble",
+            "--no-restore-on-browser-startup",
         ]
 
         # Docker or virtual display (Xvfb) flags

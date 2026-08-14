@@ -12,6 +12,10 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -194,8 +198,48 @@ async def healthz():
     return {"status": "ok"}
 
 
+def _ensure_xvfb() -> None:
+    """
+    On Linux, automatically re-exec the process under xvfb-run if:
+      - We are not already inside a virtual display (DISPLAY != :99xx)
+      - xvfb-run is available
+      - USE_XVFB env var is not explicitly set to 'false'
+
+    This guarantees zero focus-stealing even when the server is started
+    directly (e.g. by a code agent via `python -m src.api.server`) rather
+    than through start_server.sh.
+    """
+    if sys.platform != "linux":
+        return
+    if os.environ.get("USE_XVFB", "").lower() == "false":
+        return
+    if os.environ.get("_XVFB_WRAPPED", "") == "1":
+        return  # already inside xvfb-run — avoid infinite loop
+
+    display = os.environ.get("DISPLAY", "")
+    # If already on a virtual display (:99, :100, etc.) skip re-wrapping
+    if display and ":99" in display:
+        return
+
+    xvfb = shutil.which("xvfb-run")
+    if not xvfb:
+        return
+
+    log.info(
+        "Auto-detected: not running under Xvfb virtual display. "
+        "Re-launching inside Xvfb to prevent focus interruption..."
+    )
+    env = os.environ.copy()
+    env["_XVFB_WRAPPED"] = "1"
+    cmd = [xvfb, "-a", sys.executable, "-m", "src.api.server"] + sys.argv[1:]
+    result = subprocess.run(cmd, env=env)
+    sys.exit(result.returncode)
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    _ensure_xvfb()
 
     uvicorn.run(
         "src.api.server:app",
