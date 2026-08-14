@@ -164,6 +164,13 @@ class Config:
     RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "1200000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
 
+    # Maximum number of active browser tabs held open for persistent sessions.
+    # When this limit is reached the least-recently-used idle tab is closed
+    # (its conversation URL is preserved and the tab is reopened transparently
+    # on the next request for that session).
+    # Increase for more parallelism at the cost of more RAM.
+    MAX_ACTIVE_TABS: int = int(os.getenv("MAX_ACTIVE_TABS", "4"))
+
     # Human simulation (ms)
     TYPING_SPEED_MIN: int = int(os.getenv("TYPING_SPEED_MIN", "50"))
     TYPING_SPEED_MAX: int = int(os.getenv("TYPING_SPEED_MAX", "150"))

@@ -16,6 +16,7 @@ import json
 import re
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -158,15 +159,33 @@ _page_pool: BrowserPagePool | None = None
 
 class PersistentSessionManager:
     """
-    Manages persistent browser pages for sessions that require continuous conversation
-    within the same ChatGPT thread (avoiding new chat navigations and CAPTCHAs).
+    Manages persistent browser pages for sessions.
+
+    Key features:
+    - Session → ChatGPT conversation URL mapping: each session_id remembers
+      which /c/<thread_id> URL it belongs to so it can resume without starting
+      a new chat on every restart.
+    - LRU tab cap: at most MAX_ACTIVE_TABS tabs are open at once.  When the
+      limit is reached the least-recently-used *idle* tab is closed to free
+      memory.  Its URL is preserved so it can be reopened transparently on the
+      next request.
     """
 
     def __init__(self, browser: Any = None):
         self._browser = browser
+
+        # session_id → open Page object (only sessions with an open tab)
         self._pages: dict[str, Page] = {}
+        # session_id → asyncio.Lock (one lock per session for serialisation)
         self._locks: dict[str, asyncio.Lock] = {}
+        # session_id → ChatGPT conversation URL (persists even when tab closed)
+        self._session_urls: dict[str, str] = {}
+        # LRU order: session_id → last-used timestamp; OrderedDict keeps insertion order
+        self._lru: OrderedDict[str, float] = OrderedDict()
+        # Sessions whose first message has been sent (used for prompt pruning)
         self._session_initialized: set[str] = set()
+        # Lock protecting _lru / _pages structural modifications
+        self._evict_lock = asyncio.Lock()
 
     def set_browser(self, browser: Any) -> None:
         self._browser = browser
@@ -176,17 +195,109 @@ class PersistentSessionManager:
             self._locks[session_id] = asyncio.Lock()
         return self._locks[session_id]
 
+    # ── LRU helpers ──────────────────────────────────────────────────────────
+
+    def _touch(self, session_id: str) -> None:
+        """Mark session as most-recently used."""
+        self._lru[session_id] = time.monotonic()
+        self._lru.move_to_end(session_id)  # most-recent at the end
+
+    def _active_tab_count(self) -> int:
+        return sum(
+            1 for p in self._pages.values()
+            if p is not None and not p.is_closed()
+        )
+
+    async def _evict_lru_idle(self) -> None:
+        """
+        Close the least-recently-used tab that is not currently locked.
+        Its URL mapping is kept so the session can be transparently restored
+        on the next request.
+        """
+        async with self._evict_lock:
+            for sid in list(self._lru.keys()):  # oldest first
+                lock = self._locks.get(sid)
+                if lock and lock.locked():
+                    continue  # skip sessions currently in use
+                page = self._pages.get(sid)
+                if page and not page.is_closed():
+                    try:
+                        # Save URL before closing
+                        url = page.url or ""
+                        if "/c/" in url:
+                            self._session_urls[sid] = url
+                        await page.close()
+                        log.info(
+                            f"[LRU] Evicted tab for session '{sid}' "
+                            f"(url={self._session_urls.get(sid, 'none')})"
+                        )
+                    except Exception as e:
+                        log.debug(f"[LRU] Error closing evicted tab: {e}")
+                    finally:
+                        self._pages.pop(sid, None)
+                    return  # evicted one tab — done
+
+    # ── URL tracking ─────────────────────────────────────────────────────────
+
+    async def _save_conversation_url(self, session_id: str, page: Page) -> None:
+        """Extract and persist the ChatGPT conversation URL from page after send."""
+        try:
+            url = page.url or ""
+            if "/c/" in url:
+                self._session_urls[session_id] = url
+                log.debug(f"[Session] Saved URL for '{session_id}': {url}")
+        except Exception:
+            pass
+
+    # ── Public info ──────────────────────────────────────────────────────────
+
+    def session_info(self) -> list[dict]:
+        """Return a list of dicts with info about all known sessions."""
+        rows = []
+        for sid, ts in self._lru.items():
+            page = self._pages.get(sid)
+            is_open = page is not None and not page.is_closed()
+            age_s = int(time.monotonic() - ts)
+            rows.append({
+                "session_id": sid,
+                "tab_open": is_open,
+                "conversation_url": self._session_urls.get(sid),
+                "last_used_seconds_ago": age_s,
+            })
+        # Most-recently-used last → reverse for display (newest first)
+        rows.reverse()
+        return rows
+
+    # ── Main context manager ──────────────────────────────────────────────────
+
     @asynccontextmanager
     async def acquire_session_page(self, session_id: str):
-        """Acquire the persistent Page bound to session_id with per-session locking."""
+        """Acquire the persistent Page bound to session_id.
+
+        - Opens a new tab if the session has no open tab.
+        - If the tab limit is reached, evicts the LRU idle tab first.
+        - Navigates to the session's known conversation URL if one exists,
+          otherwise starts a fresh chat.
+        - After the caller is done, captures the updated conversation URL.
+        """
         lock = self._get_lock(session_id)
         await lock.acquire()
         page: Page | None = None
         try:
+            self._touch(session_id)
             page = self._pages.get(session_id)
             is_first_turn = session_id not in self._session_initialized
 
             if page is None or page.is_closed():
+                # ── Evict LRU tab if at the limit ────────────────────────────
+                if self._active_tab_count() >= Config.MAX_ACTIVE_TABS:
+                    log.info(
+                        f"[LRU] Tab limit ({Config.MAX_ACTIVE_TABS}) reached — "
+                        "evicting least-recently-used idle tab"
+                    )
+                    await self._evict_lru_idle()
+
+                # ── Open a new tab ────────────────────────────────────────────
                 if self._browser and getattr(self._browser, "context", None):
                     page = await self._browser.new_page()
                 elif self._browser and getattr(self._browser, "page", None):
@@ -194,26 +305,38 @@ class PersistentSessionManager:
                 else:
                     raise RuntimeError("Browser is not running")
 
-                target_url = Config.provider_url()
-                current_url = page.url or ""
-                if target_url not in current_url:
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-                else:
+                # ── Navigate to known URL or start fresh ──────────────────────
+                known_url = self._session_urls.get(session_id)
+                if known_url:
+                    log.info(
+                        f"[Session] Restoring '{session_id}' → {known_url}"
+                    )
                     try:
-                        new_chat_btn = await page.query_selector(
-                            "a[data-testid='create-new-chat-button'], a[href='/']"
+                        await page.goto(
+                            known_url, wait_until="domcontentloaded", timeout=25000
                         )
-                        if new_chat_btn:
-                            await new_chat_btn.click()
-                            await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
+                        is_first_turn = False  # resuming existing conversation
+                    except Exception as e:
+                        log.warning(
+                            f"[Session] Failed to restore URL for '{session_id}': {e}. "
+                            "Starting fresh chat."
+                        )
+                        known_url = None
+
+                if not known_url:
+                    target_url = Config.provider_url()
+                    await page.goto(
+                        target_url, wait_until="domcontentloaded", timeout=25000
+                    )
+                    is_first_turn = True
 
                 self._pages[session_id] = page
                 self._session_initialized.add(session_id)
-                is_first_turn = True
 
             yield page, is_first_turn
+
+            # ── After send: capture updated conversation URL ───────────────
+            await self._save_conversation_url(session_id, page)
 
         finally:
             lock.release()
@@ -1973,12 +2096,19 @@ async def create_anthropic_message(request: Request):
 
 @openai_router.get("/v1/tabs")
 async def get_open_tabs():
-    """Return info about all open browser tabs/pages."""
+    """Return info about all open browser tabs/pages, enriched with session metadata."""
     if not _browser:
-        return {"tabs": []}
+        return {"tabs": [], "sessions": [], "active_tabs": 0, "max_active_tabs": Config.MAX_ACTIVE_TABS}
     context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
     if not context:
-        return {"tabs": []}
+        return {"tabs": [], "sessions": [], "active_tabs": 0, "max_active_tabs": Config.MAX_ACTIVE_TABS}
+
+    # Build a reverse map: Page → session_id for annotation
+    page_to_session: dict[int, str] = {}
+    if _session_manager:
+        for sid, p in _session_manager._pages.items():
+            if p and not p.is_closed():
+                page_to_session[id(p)] = sid
 
     tabs = []
     for idx, p in enumerate(context.pages):
@@ -1989,12 +2119,32 @@ async def get_open_tabs():
                 title = await asyncio.wait_for(p.title(), timeout=0.8)
             except Exception:
                 pass
-            tabs.append({
+            session_id = page_to_session.get(id(p))
+            tab_info: dict = {
                 "index": idx,
                 "url": url,
                 "title": title or f"Tab #{idx}",
-            })
-    return {"tabs": tabs}
+                "session_id": session_id,
+            }
+            if session_id and _session_manager:
+                last_used = _session_manager._lru.get(session_id)
+                if last_used is not None:
+                    tab_info["last_used_seconds_ago"] = int(time.monotonic() - last_used)
+                conv_url = _session_manager._session_urls.get(session_id)
+                if conv_url:
+                    tab_info["conversation_url"] = conv_url
+            tabs.append(tab_info)
+
+    # All known sessions (including those whose tab is currently closed)
+    sessions = _session_manager.session_info() if _session_manager else []
+
+    return {
+        "tabs": tabs,
+        "active_tabs": len(tabs),
+        "max_active_tabs": Config.MAX_ACTIVE_TABS,
+        "total_known_sessions": len(sessions),
+        "sessions": sessions,
+    }
 
 
 @openai_router.post("/v1/tabs/close")
@@ -2018,12 +2168,19 @@ async def close_tab(tab: int = 0):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to reset page: {e}")
 
-    # Remove from session manager if associated
+    # Remove from session manager if associated; preserve URL mapping for later restore
     if _session_manager:
         for sid, p in list(_session_manager._pages.items()):
             if p == target_page:
+                # Save current conversation URL before closing
+                url = target_page.url or ""
+                if "/c/" in url:
+                    _session_manager._session_urls[sid] = url
                 _session_manager._pages.pop(sid, None)
-                _session_manager._session_initialized.discard(sid)
+                log.info(
+                    f"User closed tab for session '{sid}' via monitor "
+                    f"(URL preserved: {_session_manager._session_urls.get(sid, 'none')})"
+                )
                 break
 
     try:
