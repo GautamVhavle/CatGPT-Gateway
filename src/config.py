@@ -46,6 +46,9 @@ class Config:
     # Browser
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
     SLOW_MO: int = int(os.getenv("SLOW_MO", "25"))
+    # Parallel ChatGPT/Claude tabs. Same-session requests stay serial.
+    MAX_CONCURRENT_REQUESTS: int = max(1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "3")))
+    MAX_ACTIVE_TABS: int = max(1, int(os.getenv("MAX_ACTIVE_TABS", "4")))
     BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "chrome").strip().lower()
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")

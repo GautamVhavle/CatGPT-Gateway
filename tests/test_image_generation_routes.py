@@ -54,6 +54,12 @@ class _StubImageClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
+    async def new_chat(self) -> None:
+        return None
+
+    def _extract_thread_id(self) -> str:
+        return "thread-1"
+
     async def generate_image(
         self,
         prompt: str,

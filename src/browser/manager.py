@@ -257,6 +257,8 @@ class BrowserManager:
             # even with a fresh user-data-dir.
             "--disable-extensions",
             "--disable-component-extensions-with-background-pages",
+            "--hide-crash-restore-bubble",
+            "--disable-session-crashed-bubble",
         ]
 
         # Docker-specific flags
@@ -329,6 +331,14 @@ class BrowserManager:
 
         log.info(f"Browser ready — viewport {width}x{height}")
         return self._page
+
+    async def new_page(self) -> Page:
+        """Open an extra tab in the persistent context for concurrent requests."""
+        if self._context is None:
+            raise RuntimeError("Browser not started. Call start() first.")
+        page = await self._context.new_page()
+        log.info("Opened additional browser tab")
+        return page
 
     async def _clear_dns_cache(self) -> None:
         """Clear Chrome's in-memory DNS host cache via chrome://net-internals."""

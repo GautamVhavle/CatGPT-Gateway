@@ -10,6 +10,7 @@ Same interface as ChatGPTClient so the API layer is provider-agnostic.
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 import time
 
@@ -46,6 +47,14 @@ class ClaudeClient:
     def page(self) -> Page:
         return self._page
 
+    def bind_page(self, page: Page | None) -> ClaudeClient:
+        """Return a client bound to a specific tab without mutating this instance."""
+        if page is None or page is self._page:
+            return self
+        bound = copy.copy(self)
+        bound._page = page
+        return bound
+
     # ── Core: Send & Receive ────────────────────────────────────
 
     async def send_message(
@@ -79,17 +88,16 @@ class ClaudeClient:
         # 1. Brief pause (human would take a moment to start typing)
         await random_delay(250, 700)
 
-        # 1.5. Upload files/images if provided
-        if all_attachments:
-            await self._upload_files(all_attachments)
-
         # 2. Find the chat input
         input_selector = await self._find_selector(ClaudeSelectors.CHAT_INPUT, "chat input")
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message
+        # 3. Paste the message first so composer edits cannot wipe attachments.
         await human_type(self._page, input_selector, text)
+
+        if all_attachments:
+            await self._upload_files(all_attachments)
 
         # Small pause after pasting
         await random_delay(150, 350)
@@ -302,10 +310,19 @@ class ClaudeClient:
                 log.error(f"Failed to upload files: {e}")
                 raise RuntimeError(f"Could not upload files: {e}")
 
-        # Wait for files to be processed
-        await asyncio.sleep(3)
-        if len(valid_paths) > 1:
-            await asyncio.sleep(len(valid_paths))
+        badge_selector = ", ".join(ClaudeSelectors.ATTACHMENT_BADGE)
+        try:
+            await self._page.wait_for_selector(
+                badge_selector,
+                timeout=8000,
+                state="attached",
+            )
+            log.info("Attachment badge detected in composer")
+        except Exception:
+            log.debug("Attachment badge wait timed out, using fallback sleep")
+            await asyncio.sleep(3)
+            if len(valid_paths) > 1:
+                await asyncio.sleep(len(valid_paths))
         log.info("File upload complete")
 
     def _extract_thread_id(self) -> str:

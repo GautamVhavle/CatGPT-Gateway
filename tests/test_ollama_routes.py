@@ -98,7 +98,7 @@ class OllamaRouteTests(unittest.TestCase):
         self.assertEqual(len(payload["embeddings"][0]), 768)
 
     def test_chat_stream_endpoint_returns_ndjson(self) -> None:
-        async def _fake_execute(request, app_key_override=""):
+        async def _fake_execute(request, app_key_override="", http_request=None):
             _ = request, app_key_override
             return _make_stub_chat_response(text="streamed hello")
 
@@ -123,7 +123,7 @@ class OllamaRouteTests(unittest.TestCase):
         self.assertIn('"done": true', lines[1])
 
     def test_generate_scoped_endpoint_maps_to_chat_backend(self) -> None:
-        async def _fake_execute(request, app_key_override=""):
+        async def _fake_execute(request, app_key_override="", http_request=None):
             self.assertEqual(app_key_override, "endpoint:demo")
             self.assertEqual(request.messages[0].role, "user")
             return _make_stub_chat_response(model=request.model, text="generated text")

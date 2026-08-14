@@ -47,6 +47,7 @@ if "playwright_stealth" not in sys.modules:
     sys.modules["playwright_stealth"] = playwright_stealth_mod
 
 from src.api.openai_routes import (
+    _anthropic_messages_to_chat_request,
     _build_page_extraction_note,
     _build_page_extraction_response_format,
     _chat_completion_sse_chunk,
@@ -54,10 +55,12 @@ from src.api.openai_routes import (
     _display_app_name,
     _derive_app_key,
     _infer_expected_item_count,
+    _latest_turn_messages,
     _looks_like_instruction_prefix,
     _merge_header_rows_in_array,
     _structured_cardinality_mismatch,
     _should_use_line_cardinality_fallback,
+    _tab_session_key,
     _validate_chat_request,
     _responses_input_to_messages,
     _responses_request_to_chat_request,
@@ -472,6 +475,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            http_request=None,
         ) -> ChatCompletionResponse:
             captured["app_key_override"] = app_key_override
             return ChatCompletionResponse(
@@ -503,6 +507,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            http_request=None,
         ) -> ChatCompletionResponse:
             captured["stream"] = bool(request.stream)
             return ChatCompletionResponse(
@@ -541,6 +546,7 @@ class ResponsesAPITests(unittest.TestCase):
         async def fake_execute_chat_completion(
             request: ChatCompletionRequest,
             app_key_override: str = "",
+            http_request=None,
         ) -> ChatCompletionResponse:
             captured["stream"] = bool(request.stream)
             return ChatCompletionResponse(
@@ -576,6 +582,47 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("Unsupported model", ctx.exception.detail)
 
+    def test_latest_turn_messages_keeps_system_and_latest_user_tools(self) -> None:
+        messages = [
+            ChatMessage(role="system", content="Be brief"),
+            ChatMessage(role="user", content="first"),
+            ChatMessage(role="assistant", content="ok"),
+            ChatMessage(role="user", content="second"),
+            ChatMessage(role="tool", content="tool-result", tool_call_id="call_1"),
+        ]
+        pruned = _latest_turn_messages(messages)
+        self.assertEqual([m.role for m in pruned], ["system", "user", "tool"])
+        self.assertEqual(pruned[1].content, "second")
+
+    def test_tab_session_key_prefers_session_header(self) -> None:
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hello")],
+            user="alice",
+            thread_id="thread-1",
+        )
+        http_req = _make_request({"x-session-id": "sess-9"})
+        self.assertEqual(_tab_session_key(req, http_req, app_key="user:alice"), "sess-9")
+
+    def test_tab_session_key_falls_back_to_app_key(self) -> None:
+        req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])
+        self.assertEqual(_tab_session_key(req, None, app_key="endpoint:mealie"), "app:endpoint:mealie")
+
+    def test_anthropic_messages_to_chat_request(self) -> None:
+        body = {
+            "model": "catgpt-browser",
+            "system": "You are helpful",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Hello from Claude Code"}],
+                }
+            ],
+            "session_id": "cli-1",
+        }
+        converted = _anthropic_messages_to_chat_request(body)
+        self.assertEqual(converted.user, "cli-1")
+        self.assertEqual(converted.messages[0].role, "system")
+        self.assertEqual(converted.messages[1].content, "Hello from Claude Code")
 
 
 if __name__ == "__main__":

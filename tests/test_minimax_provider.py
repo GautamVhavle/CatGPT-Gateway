@@ -62,8 +62,10 @@ class RecordingProviderClient:
         file_paths=None,
         model: str | None = None,
         stateless: bool = False,
+        read_aloud: bool = False,
     ) -> ChatResponse:
         self.model = model
+        _ = text, image_paths, file_paths, stateless, read_aloud
         return ChatResponse(message="Provider response", thread_id="thread-id")
 
     async def new_chat(self) -> None:
@@ -113,7 +115,7 @@ class MiniMaxProviderTests(unittest.TestCase):
         )
 
     def test_models_endpoint_lists_target_models(self) -> None:
-        with patch.object(Config, "PROVIDER", "minimax"):
+        with patch.object(openai_routes.Config, "PROVIDER", "minimax"):
             response = asyncio.run(openai_routes.list_models())
 
         self.assertEqual(
@@ -140,7 +142,7 @@ class MiniMaxProviderTests(unittest.TestCase):
             openai_routes._lock = None
             openai_routes._thread_message_count = 0
             openai_routes._last_response_time = 0.0
-            with patch.object(Config, "PROVIDER", "minimax"):
+            with patch.object(openai_routes.Config, "PROVIDER", "minimax"):
                 response = asyncio.run(
                     openai_routes.create_chat_completion(request)
                 )
@@ -166,7 +168,7 @@ class MiniMaxProviderTests(unittest.TestCase):
             openai_routes._lock = None
             openai_routes._thread_message_count = 0
             openai_routes._last_response_time = 0.0
-            with patch.object(Config, "PROVIDER", "minimax"):
+            with patch.object(openai_routes.Config, "PROVIDER", "minimax"):
                 asyncio.run(
                     openai_routes.create_chat_completion(
                         ChatCompletionRequest(
@@ -214,7 +216,7 @@ class MiniMaxProviderTests(unittest.TestCase):
         openai_routes._client = client
 
         try:
-            with patch.object(Config, "PROVIDER", "minimax"):
+            with patch.object(openai_routes.Config, "PROVIDER", "minimax"):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(openai_routes.create_chat_completion(request))
 

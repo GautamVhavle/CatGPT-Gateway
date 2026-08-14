@@ -3,10 +3,11 @@ OpenAI-compatible API routes.
 
 Provides:
   POST /v1/chat/completions   - chat completions (with tool/function calling)
+  POST /v1/messages           - Anthropic Messages API adapter
   GET  /v1/models             - list available models
 
-All requests are serialized through an asyncio.Lock because the underlying
-Playwright browser page is single-threaded.
+Browser work is coordinated through acquire_browser_page so independent
+sessions can run in parallel tabs.
 """
 
 from __future__ import annotations
@@ -56,7 +57,11 @@ from src.api.attachment_expander import (
     build_attachment_context_note,
     expand_attachments_for_chatgpt,
 )
-from src.api.browser_gate import browser_access_lock
+from src.api.browser_gate import (
+    CLEANUP_SESSION,
+    acquire_browser_page,
+    browser_access_lock,
+)
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
@@ -108,6 +113,8 @@ _CACHE_MAX_ENTRIES = 256
 _CONTRACT_TTL_SECONDS = max(60, Config.API_THREAD_CONTRACT_TTL_SECONDS)
 _APP_THREAD_TTL_SECONDS = max(300, Config.API_APP_THREAD_TTL_SECONDS)
 _APP_KEY_HEADERS = (
+    "x-session-id",
+    "session-id",
     "x-catgpt-app-key",
     "x-app-name",
     "x-client-name",
@@ -130,6 +137,57 @@ def _get_client() -> ProviderClient:
     if _client is None:
         raise HTTPException(status_code=503, detail="Provider client not initialized")
     return _client
+
+
+def _bind_client(client: ProviderClient, page: Any | None) -> ProviderClient:
+    """Bind a provider client to a leased tab when the pool supplied one."""
+    bind_page = getattr(client, "bind_page", None)
+    if page is None or not callable(bind_page):
+        return client
+    return bind_page(page)
+
+
+def _tab_session_key(
+    request: Any,
+    http_request: Request | None,
+    app_key: str = "",
+) -> str | None:
+    """Stable tab identity: session header, thread id, app key, then user."""
+    if http_request is not None:
+        for header_name in ("x-session-id", "session-id"):
+            value = (http_request.headers.get(header_name) or "").strip()
+            if value:
+                return value
+    thread_id = (getattr(request, "thread_id", None) or "").strip()
+    if thread_id:
+        return f"thread:{thread_id}"
+    if app_key:
+        return f"app:{app_key}"
+    user = (getattr(request, "user", None) or "").strip()
+    if user:
+        return f"user:{user}"
+    return None
+
+
+def _latest_turn_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Keep system prompts plus the latest user turn and its tool results.
+
+    ChatGPT already has prior turns when we stay on a thread, so resending the
+    client's full history only bloats the composer.
+    """
+    if not messages:
+        return []
+    systems = [message for message in messages if message.role == "system"]
+    latest: list[ChatMessage] = []
+    for message in reversed(messages):
+        if message.role in {"user", "tool"}:
+            latest.insert(0, message)
+            if message.role == "user":
+                break
+    if not latest:
+        non_system = [message for message in messages if message.role != "system"]
+        latest = non_system[-1:]
+    return systems + latest
 
 
 # -- Helpers -----------------------------------------------------
@@ -338,9 +396,8 @@ def _prune_app_threads(now: float) -> list[str]:
 async def _maybe_delete_expired_app_threads(thread_ids: list[str]) -> None:
     """Best-effort deletion of expired app-tracked ChatGPT threads via the web UI.
 
-    Acquires browser_access_lock to avoid racing active requests. Callers that
-    schedule this via asyncio.create_task should ensure they do NOT hold the
-    lock themselves (otherwise the task deadlocks).
+    Acquires a cleanup tab (or the process lock when the pool is down) so
+    deletion cannot race an in-flight request on the same page.
     """
     if not thread_ids or not Config.API_APP_THREAD_DELETE_EXPIRED:
         return
@@ -353,10 +410,11 @@ async def _maybe_delete_expired_app_threads(thread_ids: list[str]) -> None:
         log.debug("App-thread deletion is only supported for ChatGPT provider")
         return
 
-    async with browser_access_lock:
+    async with acquire_browser_page(CLEANUP_SESSION) as lease:
+        bound = _bind_client(client, lease.page)
         for tid in thread_ids:
             try:
-                ok = await client.delete_thread(tid)
+                ok = await bound.delete_thread(tid)
                 if ok:
                     log.info(f"Deleted expired app-tracked thread: {tid}")
                 else:
@@ -1481,6 +1539,7 @@ def _resolve_image_app_key(
 async def _execute_image_generation(
     request: ImageGenerationRequest,
     app_key_override: str = "",
+    http_request: Request | None = None,
 ) -> ImagesResponse:
     """Shared executor for generic and app-scoped image generation."""
     import base64
@@ -1497,11 +1556,13 @@ async def _execute_image_generation(
         raise HTTPException(status_code=422, detail="Image generation is only supported by the ChatGPT provider")
 
     _deletion_pending: list[str] = []
+    app_key = (app_key_override or "").strip()
+    session_key = _tab_session_key(request, http_request, app_key)
 
     try:
-        async with browser_access_lock:
+        async with acquire_browser_page(session_key) as lease:
+            client = _bind_client(client, lease.page)
             start_time = time.time()
-            app_key = (app_key_override or "").strip()
             app_name = _display_app_name(app_key)
             app_thread_created_by_catgpt = False
 
@@ -1530,6 +1591,10 @@ async def _execute_image_generation(
                     )
                     await client.new_chat()
                     app_thread_created_by_catgpt = True
+            elif Config.uses_browser() and not (session_key and not lease.is_first_turn):
+                new_chat = getattr(client, "new_chat", None)
+                if callable(new_chat):
+                    await new_chat()
 
             log.info(
                 "POST /v1/images/generations - model=%s, prompt=%r, n=%s, size=%s, response_format=%s",
@@ -1659,7 +1724,11 @@ async def create_image(
 ) -> ImagesResponse:
     """OpenAI-compatible image generation endpoint."""
     app_key = _resolve_image_app_key(request, http_request)
-    return await _execute_image_generation(request, app_key_override=app_key)
+    return await _execute_image_generation(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
 
 @openai_router.post("/{app_name}/v1/images/generations", response_model=ImagesResponse)
@@ -1670,7 +1739,11 @@ async def create_image_scoped(
 ) -> ImagesResponse:
     """App-scoped alias for image generation."""
     app_key = _resolve_image_app_key(request, http_request, endpoint_app_name=app_name)
-    return await _execute_image_generation(request, app_key_override=app_key)
+    return await _execute_image_generation(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
 
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -1688,8 +1761,16 @@ async def create_chat_completion(
     _validate_chat_request(request)
     app_key = _resolve_app_key(request, http_request)
     if request.stream:
-        return await _stream_chat_completion(request, app_key_override=app_key)
-    return await _execute_chat_completion(request, app_key_override=app_key)
+        return await _stream_chat_completion(
+            request,
+            app_key_override=app_key,
+            http_request=http_request,
+        )
+    return await _execute_chat_completion(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
 
 
@@ -1707,8 +1788,16 @@ async def create_responses(
     _validate_responses_request(request)
     app_key = _resolve_app_key(request, http_request)
     if request.stream:
-        return await _stream_responses(request, app_key_override=app_key)
-    return await _execute_responses(request, app_key_override=app_key)
+        return await _stream_responses(
+            request,
+            app_key_override=app_key,
+            http_request=http_request,
+        )
+    return await _execute_responses(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
 
 @openai_router.post("/{app_name}/v1/responses", response_model=ResponsesResponse)
@@ -1721,8 +1810,16 @@ async def create_responses_scoped(
     _validate_responses_request(request)
     app_key = _resolve_app_key(request, http_request, endpoint_app_name=app_name)
     if request.stream:
-        return await _stream_responses(request, app_key_override=app_key)
-    return await _execute_responses(request, app_key_override=app_key)
+        return await _stream_responses(
+            request,
+            app_key_override=app_key,
+            http_request=http_request,
+        )
+    return await _execute_responses(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
 @openai_router.post("/{app_name}/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion_scoped(
@@ -1734,9 +1831,153 @@ async def create_chat_completion_scoped(
     _validate_chat_request(request)
     app_key = _resolve_app_key(request, http_request, endpoint_app_name=app_name)
     if request.stream:
-        return await _stream_chat_completion(request, app_key_override=app_key)
-    return await _execute_chat_completion(request, app_key_override=app_key)
+        return await _stream_chat_completion(
+            request,
+            app_key_override=app_key,
+            http_request=http_request,
+        )
+    return await _execute_chat_completion(
+        request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
 
+
+def _anthropic_content_to_text(content: Any) -> str:
+    """Flatten Anthropic message content blocks to a prompt string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def _anthropic_messages_to_chat_request(body: dict[str, Any]) -> ChatCompletionRequest:
+    """Translate an Anthropic Messages body into a chat completion request."""
+    messages: list[ChatMessage] = []
+    system = body.get("system")
+    if system:
+        if isinstance(system, list):
+            system_text = _anthropic_content_to_text(system)
+        else:
+            system_text = str(system)
+        if system_text.strip():
+            messages.append(ChatMessage(role="system", content=system_text))
+
+    for item in body.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user")
+        if role not in {"user", "assistant"}:
+            role = "user"
+        messages.append(ChatMessage(role=role, content=_anthropic_content_to_text(item.get("content"))))
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages array cannot be empty")
+
+    return ChatCompletionRequest(
+        model=str(body.get("model") or Config.default_model_id()),
+        messages=messages,
+        max_tokens=body.get("max_tokens"),
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+        stream=bool(body.get("stream")),
+        user=(body.get("user") or body.get("session_id") or None),
+        thread_id=body.get("thread_id"),
+    )
+
+
+def _anthropic_message_payload(
+    chat_response: ChatCompletionResponse,
+    model_id: str,
+) -> dict[str, Any]:
+    text = chat_response.choices[0].message.content or ""
+    prompt_tokens = chat_response.usage.prompt_tokens if chat_response.usage else 1
+    completion_tokens = chat_response.usage.completion_tokens if chat_response.usage else _estimate_tokens(text)
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model_id,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+        },
+    }
+
+
+@openai_router.post("/v1/messages")
+async def create_anthropic_message(http_request: Request):
+    """Anthropic Messages API adapter for Claude Code CLI and similar clients."""
+    try:
+        body = await http_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Request body must be JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    chat_request = _anthropic_messages_to_chat_request(body)
+    _validate_chat_request(chat_request)
+    app_key = _resolve_app_key(chat_request, http_request)
+    chat_response = await _execute_chat_completion(
+        chat_request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
+    payload = _anthropic_message_payload(chat_response, chat_response.model)
+
+    if not chat_request.stream:
+        return payload
+
+    text = payload["content"][0]["text"]
+
+    async def _events():
+        yield (
+            "event: message_start\n"
+            f"data: {json.dumps({'type': 'message_start', 'message': {**payload, 'content': [], 'stop_reason': None}}, ensure_ascii=False)}\n\n"
+        )
+        yield (
+            "event: content_block_start\n"
+            f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n"
+        )
+        if text:
+            yield (
+                "event: content_block_delta\n"
+                f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text}}, ensure_ascii=False)}\n\n"
+            )
+        yield (
+            "event: content_block_stop\n"
+            f"data: {json.dumps({'type': 'content_block_stop', 'index': 0}, ensure_ascii=False)}\n\n"
+        )
+        yield (
+            "event: message_delta\n"
+            f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': payload['usage']['output_tokens']}}, ensure_ascii=False)}\n\n"
+        )
+        yield (
+            "event: message_stop\n"
+            f"data: {json.dumps({'type': 'message_stop'}, ensure_ascii=False)}\n\n"
+        )
+
+    return StreamingResponse(
+        _events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # -- Responses API translation helpers --------------------------
@@ -1885,6 +2126,7 @@ def _chat_completion_sse_chunk(
 async def _stream_chat_completion(
     request: ChatCompletionRequest,
     app_key_override: str = "",
+    http_request: Request | None = None,
 ) -> StreamingResponse:
     """Return a Chat Completions SSE stream after the browser response completes.
 
@@ -1898,6 +2140,7 @@ async def _stream_chat_completion(
         response = await _execute_chat_completion(
             non_stream_request,
             app_key_override=app_key_override,
+            http_request=http_request,
         )
         choice = response.choices[0]
         message = choice.message
@@ -1947,6 +2190,7 @@ async def _stream_chat_completion(
 async def _stream_responses(
     request: ResponsesRequest,
     app_key_override: str = "",
+    http_request: Request | None = None,
 ) -> StreamingResponse:
     """Return a Responses API SSE stream after the browser response completes.
 
@@ -1956,7 +2200,11 @@ async def _stream_responses(
     """
 
     async def _events():
-        response = await _execute_responses(request, app_key_override=app_key_override)
+        response = await _execute_responses(
+            request,
+            app_key_override=app_key_override,
+            http_request=http_request,
+        )
         response_dict = _model_dump_compat(response, mode="json")
         text = ""
         for item in response.output:
@@ -2005,6 +2253,7 @@ def _validate_responses_request(request: ResponsesRequest) -> None:
 async def _execute_responses(
     request: ResponsesRequest,
     app_key_override: str = "",
+    http_request: Request | None = None,
 ) -> ResponsesResponse:
     """Shared executor for Responses API requests.
 
@@ -2013,29 +2262,35 @@ async def _execute_responses(
     """
     chat_request = _responses_request_to_chat_request(request)
     chat_request.stream = False
-    chat_response = await _execute_chat_completion(chat_request, app_key_override=app_key_override)
+    chat_response = await _execute_chat_completion(
+        chat_request,
+        app_key_override=app_key_override,
+        http_request=http_request,
+    )
     return _responses_response_from_chat(chat_response, request.model)
 
 async def _execute_chat_completion(
     request: ChatCompletionRequest,
     app_key_override: str = "",
+    http_request: Request | None = None,
 ) -> ChatCompletionResponse:
     """Shared sync/async executor for chat completions."""
     client = _get_client()
     model_id = _resolve_model_id(request.model)
+    app_key = (app_key_override or "").strip()
+    session_key = _tab_session_key(request, http_request, app_key)
 
-    # Track expired thread ids to delete *after* releasing browser_access_lock.
-    # Deletion must run under the lock itself, so we cannot inline it while this
-    # call holds the lock (it would deadlock or race).
+    # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
 
     try:
-        async with browser_access_lock:
+        async with acquire_browser_page(session_key) as lease:
+            client = _bind_client(client, lease.page)
             start_time = time.time()
-            app_key = (app_key_override or "").strip()
             app_name = _display_app_name(app_key)
             explicit_thread_id = (request.thread_id or "").strip() if getattr(request, "thread_id", None) else ""
             routing_action = "reuse-current"
+            continuing_thread = False
             app_thread_created_by_catgpt = False
             if Config.API_APP_THREAD_MODE and app_key:
                 log.info("OpenAI app-thread key: %s", app_key)
@@ -2045,9 +2300,8 @@ async def _execute_chat_completion(
                 if current_tid != explicit_thread_id:
                     log.info(f"OpenAI route: navigating to explicit thread {explicit_thread_id}")
                     await client.navigate_to_thread(explicit_thread_id)
-                    routing_action = "explicit-thread"
-                else:
-                    routing_action = "explicit-thread"
+                routing_action = "explicit-thread"
+                continuing_thread = True
             elif Config.API_APP_THREAD_MODE and app_key:
                 now_app = time.time()
                 mapped_thread = ""
@@ -2058,7 +2312,6 @@ async def _execute_chat_completion(
                     if mapped:
                         mapped_thread = mapped.thread_id
                         app_thread_created_by_catgpt = mapped.created_by_catgpt
-                # Defer deletion until after we release browser_access_lock
                 if expired_tids:
                     _deletion_pending.extend(expired_tids)
                 if mapped_thread:
@@ -2066,11 +2319,9 @@ async def _execute_chat_completion(
                     if current_tid != mapped_thread:
                         log.info(f"OpenAI app-thread mode: app='{app_key}' -> thread {mapped_thread}")
                         await client.navigate_to_thread(mapped_thread)
-                        routing_action = "mapped-thread"
-                    else:
-                        routing_action = "mapped-thread"
+                    routing_action = "mapped-thread"
+                    continuing_thread = True
                 else:
-                    # First request from this app key: start a new chat so apps do not share context.
                     log.info(
                         "OpenAI app-thread mode: app='%s' has no mapped thread. New chat will be created before prompt send.",
                         app_name,
@@ -2078,6 +2329,15 @@ async def _execute_chat_completion(
                     await client.new_chat()
                     routing_action = "new-chat-for-app"
                     app_thread_created_by_catgpt = True
+            elif session_key and not lease.is_first_turn:
+                routing_action = "persistent-session"
+                continuing_thread = True
+            elif Config.uses_browser():
+                log.info("No session identity: starting a fresh ChatGPT thread")
+                await client.new_chat()
+                routing_action = "new-chat-stateless"
+            else:
+                routing_action = "stateless-api"
 
             # -- Extract attachments from messages --------------
             image_paths: list[str] = []
@@ -2148,6 +2408,15 @@ async def _execute_chat_completion(
                 messages.insert(0, ChatMessage(role="system", content=response_format_system))
 
             messages = _dedupe_system_messages(messages)
+            if continuing_thread:
+                pruned = _latest_turn_messages(messages)
+                if len(pruned) < len(messages):
+                    log.info(
+                        "Pruned conversation history for existing thread: %d -> %d messages",
+                        len(messages),
+                        len(pruned),
+                    )
+                    messages = pruned
             system_texts = [_extract_content_text(m.content) for m in messages if m.role == "system"]
             system_lengths = [len(t) for t in system_texts]
             system_previews = [_normalize_instruction_text(t)[:120] for t in system_texts]
@@ -2290,7 +2559,7 @@ async def _execute_chat_completion(
                             created_by_catgpt=app_thread_created_by_catgpt,
                         )
                     # Best-effort deletion is scheduled after this request releases
-                    # browser_access_lock, so cleanup cannot navigate mid-request.
+                    # its tab lease, so cleanup cannot navigate mid-request.
                     if post_prune_expired:
                         _deletion_pending.extend(post_prune_expired)
                     thread_title = await _lookup_thread_title(client, thread_for_app)
