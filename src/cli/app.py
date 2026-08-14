@@ -436,7 +436,7 @@ class ChatScreen(Screen):
             "  [#58a6ff]/new[/]               Start fresh (clears history & system prompt)",
             "  [#58a6ff]/clear[/]             Clear the display  (history preserved)",
             "  [#58a6ff]/system <text>[/]     Set a system prompt for this session",
-            "  [#58a6ff]/model <name>[/]      Switch model  (e.g. /model gpt-5.5-thinking)",
+            "  [#58a6ff]/model <name>[/]      Switch model  (e.g. /model gpt-5.6-sol-high)",
             "  [#58a6ff]/history[/]           Show all conversation turns",
             "  [#58a6ff]/export [file][/]     Export conversation to markdown",
             "  [#58a6ff]/status[/]            API config & session info",

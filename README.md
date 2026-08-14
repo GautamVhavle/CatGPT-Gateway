@@ -136,14 +136,16 @@ model switcher is driven by `CHATGPT_MODEL_ALIASES` and
 | `gpt-5.6-sol-extra-high` | GPT-5.6 Sol | Extra High | `GPT-5.6 Sol`, `5.6 Sol` |
 | `gpt-5.6-sol-pro` | GPT-5.6 Sol | Pro | `GPT-5.6 Sol`, `5.6 Sol`, `Pro` |
 | `gpt-5.5` | GPT-5.5 | Instant | `GPT-5.5`, `5.5` |
+| `gpt-5.5-medium` | GPT-5.5 | Medium | `GPT-5.5`, `5.5` |
+| `gpt-5.5-high` | GPT-5.5 | High | `GPT-5.5`, `5.5` |
 | `gpt-5.5-thinking` | GPT-5.5 | High | `Thinking`, `5.5 Thinking` |
+| `gpt-5.5-extra-high` | GPT-5.5 | Extra High | `GPT-5.5`, `5.5` |
 | `gpt-5.5-pro` | GPT-5.5 | Pro | `5.5 Pro` |
-| `o3` | o3 | Instant | `o3` |
 
 Default configurable settings:
 
 ```env
-CHATGPT_MODEL_SETTINGS=gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-thinking=High,gpt-5.5-pro=Pro,o3=Instant
+CHATGPT_MODEL_SETTINGS=gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-medium=Medium,gpt-5.5-high=High,gpt-5.5-thinking=High,gpt-5.5-extra-high=Extra High,gpt-5.5-pro=Pro
 ```
 
 Example: default all `catgpt-browser` requests to GPT-5.6 Sol with High effort.
@@ -184,7 +186,7 @@ environment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CHATGPT_DEFAULT_MODEL` | empty | Model to use when a request asks for `catgpt-browser`, `auto`, or `default`. |
-| `CHATGPT_MODEL_ALIASES` | Current GPT-5.6 Sol, GPT-5.5, and o3 aliases | Comma-separated `model=label|alias` map for Advanced → Model choices. |
+| `CHATGPT_MODEL_ALIASES` | Current GPT-5.6 Sol and GPT-5.5 aliases | Comma-separated `model=label|alias` map for Advanced → Model choices. |
 | `CHATGPT_MODEL_SETTINGS` | Instant/Medium/High/Extra High/Pro mappings | Comma-separated effort map used through Advanced → Effort. |
 | `CHATGPT_MODEL_SWITCH_TIMEOUT` | `10000` | Milliseconds to wait for a model label after switching. |
 | `CHATGPT_MODEL_SWITCH_STRICT` | `false` | Return an error when a configured model is not visible instead of continuing. |
@@ -252,7 +254,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-5.4-thinking",
+    model="gpt-5.6-sol-high",
     messages=[
         {"role": "user", "content": "Summarize why browser-backed APIs are useful."}
     ],

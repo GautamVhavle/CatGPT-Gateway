@@ -42,7 +42,7 @@ def normalize_model_token(value: str) -> str:
 
 
 def _parse_model_aliases(raw: str) -> list[BrowserModelOption]:
-    """Parse a comma-separated alias list like `gpt-5.3=GPT-5.3,o3=o3`."""
+    """Parse a comma-separated alias list like `gpt-5.5=GPT-5.5,gpt-5.6-sol=GPT-5.6 Sol`."""
     options: list[BrowserModelOption] = []
     seen: set[str] = set()
 
@@ -77,7 +77,7 @@ def _parse_model_aliases(raw: str) -> list[BrowserModelOption]:
 
 
 def _parse_model_settings(raw: str) -> dict[str, str]:
-    """Parse effort mappings like `gpt-5.6-sol-high=High,o3=Instant`."""
+    """Parse effort mappings like `gpt-5.6-sol-high=High,gpt-5.5=Instant`."""
     settings: dict[str, str] = {}
     for chunk in (raw or "").split(","):
         item = chunk.strip()

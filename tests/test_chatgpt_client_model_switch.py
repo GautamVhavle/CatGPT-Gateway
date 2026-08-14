@@ -207,7 +207,7 @@ class ChatGPTClientModelSwitchTests(unittest.IsolatedAsyncioTestCase):
             [
                 "dismiss",
                 "open:Instant",
-                "menu:Effort",
+                "menu:Show advanced options",
                 "menu:Advanced",
                 "menu:Effort",
                 "option:Extra High",

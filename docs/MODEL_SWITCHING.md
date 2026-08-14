@@ -2,7 +2,15 @@
 
 CatGPT supports browser-backed ChatGPT model switching. When a request includes
 a configured model id, CatGPT opens the ChatGPT model picker, selects the
-matching UI label, waits for confirmation, and then sends the prompt.
+matching model and effort, waits for confirmation, and then sends the prompt.
+
+On ChatGPT Business / Pro (August 2026), the composer button shows the current
+effort (`Instant`, `Medium`, `High`, `Extra High`, or `Pro`). The compact menu
+exposes a Power control; **Show advanced options** reveals:
+
+- **Model:** `GPT-5.6 Sol`, `GPT-5.5` (`o3` is leaving August 26 and is not
+  exposed by default)
+- **Effort:** `Instant`, `Medium`, `High`, `Extra High`, `Pro`
 
 ## Quick Use
 
@@ -13,7 +21,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer dummy123" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5-thinking",
+    "model": "gpt-5.6-sol-high",
     "messages": [{"role": "user", "content": "Say which mode you are using."}]
   }'
 ```
@@ -35,10 +43,10 @@ curl http://localhost:8000/v1/models -H "Authorization: Bearer dummy123"
 
 ## Configuration
 
-`CHATGPT_MODEL_ALIASES` maps public API ids to visible ChatGPT picker labels:
+`CHATGPT_MODEL_ALIASES` maps public API ids to visible ChatGPT **Model** labels:
 
 ```env
-CHATGPT_MODEL_ALIASES=gpt-5.5=Instant|Latest 5.5|5.5|GPT-5.5,gpt-5.5-thinking=Thinking,gpt-5.5-pro=Pro,gpt-5.4=5.4,gpt-5.4-thinking=Thinking 5.4,gpt-5.4-pro=Pro 5.4,gpt-5.3=5.3,o3=o3
+CHATGPT_MODEL_ALIASES=gpt-5.6-sol=GPT-5.6 Sol|5.6 Sol|Instant,gpt-5.5=GPT-5.5|5.5
 ```
 
 Format:
@@ -47,23 +55,19 @@ Format:
 public_id=Primary UI Label|Alternate UI Label|Another Alternate
 ```
 
-`CHATGPT_MODEL_SETTINGS` maps model ids or UI labels to the extra setting shown
-beside configurable picker rows such as `Thinking` and `Pro`:
+`CHATGPT_MODEL_SETTINGS` maps those ids to the **Effort** submenu:
 
 ```env
-CHATGPT_MODEL_SETTINGS=gpt-5.5-thinking=Extended,gpt-5.5-pro=Standard,gpt-5.4-thinking=Extended,gpt-5.4-pro=Standard
+CHATGPT_MODEL_SETTINGS=gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-medium=Medium,gpt-5.5-high=High,gpt-5.5-thinking=High,gpt-5.5-extra-high=Extra High,gpt-5.5-pro=Pro
 ```
 
-The default configuration exposes `gpt-5.5`, `gpt-5.5-thinking`,
-`gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-thinking`, `gpt-5.4-pro`, `gpt-5.3`,
-and `o3`. The configurable Thinking/Pro rows are set to `Standard` by default.
-Use `Standard` or `Extended` exactly as shown in the ChatGPT picker.
+`gpt-5.5-thinking` remains as a compatibility alias for GPT-5.5 + High.
 
 If a request uses `catgpt-browser`, CatGPT keeps the current browser-selected
 model unless `CHATGPT_DEFAULT_MODEL` is set:
 
 ```env
-CHATGPT_DEFAULT_MODEL=gpt-5.5-thinking
+CHATGPT_DEFAULT_MODEL=gpt-5.6-sol-high
 ```
 
 By default, if a configured model is not visible in the account's picker, CatGPT
@@ -86,10 +90,10 @@ Do not set `CHATGPT_MODEL_SWITCH_TIMEOUT=1` expecting one second; that is 1 ms.
 
 ## Notes
 
-- Model availability depends on the logged-in ChatGPT account and plan.
-- Versioned GPT labels such as `5.4` may live under the picker option
-  `Configure...` rather than in the first menu. CatGPT opens Configure and
-  selects the requested version from the dialog's Model dropdown when needed.
+- Model availability depends on the logged-in ChatGPT account and plan. Free/Go
+  accounts may show Luna and a Think control instead of this Advanced picker.
+- CatGPT expands **Show advanced options** when the compact Power menu is open,
+  then clicks **Model** and **Effort**.
 - UI labels change over time. Update `CHATGPT_MODEL_ALIASES` when ChatGPT
   renames picker items.
 - The CLI also supports `/model <name>`, which changes the model id sent to the
