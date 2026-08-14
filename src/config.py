@@ -157,7 +157,11 @@ class Config:
         return cls.PROVIDER == "chatgpt"
 
     # Timeouts (ms)
-    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))
+    # RESPONSE_TIMEOUT: how long to wait for ChatGPT to finish generating.
+    # Default is 20 minutes (1 200 000 ms) because deep-thinking / reasoning
+    # models (o1, o3, o3-mini) can take 10-20 minutes for complex tasks.
+    # Override via RESPONSE_TIMEOUT env var if you need a shorter limit.
+    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "1200000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
 
     # Human simulation (ms)

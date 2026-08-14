@@ -1119,9 +1119,60 @@ async def create_chat_completion(
                 stateless=not is_persistent,
                 page=page,
             )
+        except asyncio.TimeoutError as e:
+            elapsed_s = int(time.time() - start_time)
+            log.error(f"ChatGPT response timed out after {elapsed_s}s: {e}")
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "error_type": "response_timeout",
+                    "message": (
+                        f"ChatGPT did not finish responding within {elapsed_s}s. "
+                        "Deep-thinking / reasoning models may need up to 20 minutes. "
+                        "Increase RESPONSE_TIMEOUT env var or retry."
+                    ),
+                    "elapsed_seconds": elapsed_s,
+                    "tip": "Set RESPONSE_TIMEOUT=1200000 (20 min) for o1/o3 reasoning models.",
+                },
+            )
+        except RuntimeError as e:
+            elapsed_s = int(time.time() - start_time)
+            err_str = str(e)
+            log.error(f"Provider runtime error after {elapsed_s}s: {err_str}", exc_info=True)
+            # Classify the error for the caller
+            if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+                status, error_type = 504, "response_timeout"
+                tip = "ChatGPT may still be thinking. Retry or increase RESPONSE_TIMEOUT."
+            elif "page is in error state" in err_str.lower() or "something went wrong" in err_str.lower():
+                status, error_type = 502, "chatgpt_page_error"
+                tip = "ChatGPT displayed an error page. Check http://127.0.0.1:8000/preview and retry."
+            elif "chat input" in err_str.lower() or "send button" in err_str.lower():
+                status, error_type = 503, "chatgpt_ui_unavailable"
+                tip = "ChatGPT UI elements not found. The page may need a reload — check /preview."
+            else:
+                status, error_type = 500, "provider_error"
+                tip = "Unexpected gateway error. Check server logs."
+            raise HTTPException(
+                status_code=status,
+                detail={
+                    "error_type": error_type,
+                    "message": err_str,
+                    "elapsed_seconds": elapsed_s,
+                    "tip": tip,
+                },
+            )
         except Exception as e:
-            log.error(f"Provider error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
+            elapsed_s = int(time.time() - start_time)
+            log.error(f"Unexpected provider error after {elapsed_s}s: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_type": "unexpected_error",
+                    "message": str(e),
+                    "elapsed_seconds": elapsed_s,
+                    "tip": "Check server logs for full traceback.",
+                },
+            )
 
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
