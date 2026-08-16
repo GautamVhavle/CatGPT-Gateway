@@ -67,11 +67,11 @@ class Config:
     CHATGPT_DEFAULT_MODEL: str = os.getenv("CHATGPT_DEFAULT_MODEL", "")
     CHATGPT_MODEL_ALIASES: str = os.getenv(
         "CHATGPT_MODEL_ALIASES",
-        "gpt-5.6-sol=GPT-5.6 Sol|5.6 Sol|Instant,gpt-5.6-sol-medium=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-extra-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-pro=GPT-5.6 Sol|5.6 Sol|Pro,gpt-5.5=GPT-5.5|5.5,gpt-5.5-thinking=GPT-5.5|5.5|Thinking|5.5 Thinking,gpt-5.5-pro=GPT-5.5|5.5|5.5 Pro,o3=o3",
+        "gpt-5.6-sol=GPT-5.6 Sol|5.6 Sol|Instant,gpt-5.6-sol-medium=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-extra-high=GPT-5.6 Sol|5.6 Sol,gpt-5.6-sol-pro=GPT-5.6 Sol|5.6 Sol|Pro,gpt-5.5=GPT-5.5|5.5,gpt-5.5-medium=GPT-5.5|5.5,gpt-5.5-high=GPT-5.5|5.5,gpt-5.5-thinking=GPT-5.5|5.5|Thinking|5.5 Thinking,gpt-5.5-extra-high=GPT-5.5|5.5,gpt-5.5-pro=GPT-5.5|5.5|5.5 Pro",
     )
     CHATGPT_MODEL_SETTINGS: str = os.getenv(
         "CHATGPT_MODEL_SETTINGS",
-        "gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-thinking=High,gpt-5.5-pro=Pro,o3=Instant",
+        "gpt-5.6-sol=Instant,gpt-5.6-sol-medium=Medium,gpt-5.6-sol-high=High,gpt-5.6-sol-extra-high=Extra High,gpt-5.6-sol-pro=Pro,gpt-5.5=Instant,gpt-5.5-medium=Medium,gpt-5.5-high=High,gpt-5.5-thinking=High,gpt-5.5-extra-high=Extra High,gpt-5.5-pro=Pro",
     )
     CHATGPT_MODEL_SWITCH_TIMEOUT: int = int(os.getenv("CHATGPT_MODEL_SWITCH_TIMEOUT", "10000"))
     CHATGPT_MODEL_SWITCH_STRICT: bool = os.getenv("CHATGPT_MODEL_SWITCH_STRICT", "false").lower() == "true"
