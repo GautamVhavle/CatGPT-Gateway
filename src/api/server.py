@@ -30,6 +30,7 @@ from src.config import Config
 from src.api.ollama_routes import ollama_router
 from src.api.routes import router, set_client
 from src.api.openai_routes import openai_router, set_openai_client
+from src.api.browser_gate import configure_tab_pool
 from src.log import setup_logging
 
 log = setup_logging("api_server", log_file="api_server.log")
@@ -121,8 +122,10 @@ async def lifespan(app: FastAPI):
             _client = ClaudeClient(page)
         else:
             _client = ChatGPTClient(page)
+
     set_client(_client, _browser)
     set_openai_client(_client)
+    configure_tab_pool(_browser)
 
     # ── Startup banner ───────────────────────────────────────────
     W = 60
@@ -280,15 +283,19 @@ class BearerTokenMiddleware:
             for key, value in scope.get("headers", [])
         }
         auth_header = headers.get("authorization", "")
-        if Config.API_TOKEN_OPTIONAL and not auth_header:
+        x_api_key = (headers.get("x-api-key") or "").strip()
+        anthropic_api_key = (headers.get("anthropic-api-key") or "").strip()
+        if Config.API_TOKEN_OPTIONAL and not auth_header and not x_api_key and not anthropic_api_key:
             # Optional-auth mode: no header is allowed.
             await self.app(scope, receive, send)
             return
 
         if auth_header.startswith("Bearer "):
             provided = auth_header[7:].strip()
+        elif x_api_key:
+            provided = x_api_key
         else:
-            provided = ""
+            provided = anthropic_api_key
 
         expected = token.strip()
         if provided != expected:

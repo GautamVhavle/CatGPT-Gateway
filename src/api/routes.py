@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from src.api.browser_gate import browser_access_lock
+from src.api.browser_gate import CONTROL_SESSION, acquire_browser_page, browser_access_lock
 from src.api.schemas import (
     ChatRequest,
     ChatResponse,
@@ -54,6 +54,13 @@ def _get_client():
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
+
+
+def _bind_client(client, page):
+    bind_page = getattr(client, "bind_page", None)
+    if page is None or not callable(bind_page):
+        return client
+    return bind_page(page)
 
 
 def _build_response(result) -> ChatResponse:
@@ -112,10 +119,10 @@ def _validate_model(model: str | None) -> None:
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """Send a message in the current conversation."""
-    client = _get_client()
     log.info(f"POST /chat — {len(req.message)} chars")
 
-    async with browser_access_lock:
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
         try:
             _validate_model(req.model)
             result = await client.send_message(
@@ -132,13 +139,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
 @router.post("/thread/{thread_id}/chat", response_model=ChatResponse)
 async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
     """Send a message in a specific thread. Navigates to it first."""
-    client = _get_client()
     log.info(f"POST /thread/{thread_id}/chat — {len(req.message)} chars")
 
-    async with browser_access_lock:
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
         try:
             _validate_model(req.model)
-            # Navigate to the thread if not already there
             current_tid = client._extract_thread_id()
             if current_tid != thread_id:
                 await client.navigate_to_thread(thread_id)
@@ -157,10 +163,10 @@ async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
 @router.post("/thread/new", response_model=ChatResponse)
 async def new_thread(req: ChatRequest) -> ChatResponse:
     """Start a new conversation and send the first message."""
-    client = _get_client()
     log.info(f"POST /thread/new — {len(req.message)} chars")
 
-    async with browser_access_lock:
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
         try:
             _validate_model(req.model)
             await client.new_chat()
@@ -181,10 +187,10 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
 @router.get("/threads", response_model=ThreadListResponse)
 async def list_threads() -> ThreadListResponse:
     """List recent conversation threads from the sidebar."""
-    client = _get_client()
     log.info("GET /threads")
 
-    async with browser_access_lock:
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
         try:
             raw_threads = await client.list_threads()
             threads = [
@@ -205,7 +211,8 @@ async def status() -> StatusResponse:
     """Health check — returns login status and current thread."""
     try:
         client = _get_client()
-        async with browser_access_lock:
+        async with acquire_browser_page(CONTROL_SESSION) as lease:
+            client = _bind_client(_get_client(), lease.page)
             logged_in = True if _browser is None else await _browser.is_logged_in()
             tid = client._extract_thread_id()
             return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)

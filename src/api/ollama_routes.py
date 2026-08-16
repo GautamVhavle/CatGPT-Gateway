@@ -106,7 +106,11 @@ async def ollama_chat(
     _validate_chat_request(openai_request)
     app_key = _resolve_app_key(openai_request, http_request)
     started_at = time.time()
-    response = await _execute_chat_completion(openai_request, app_key_override=app_key)
+    response = await _execute_chat_completion(
+        openai_request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
     mark_model_active(profile.name)
     return _ollama_chat_response(response, started_at, stream=request.stream)
 
@@ -122,7 +126,11 @@ async def ollama_chat_scoped(
     _validate_chat_request(openai_request)
     app_key = _resolve_app_key(openai_request, http_request, endpoint_app_name=app_name)
     started_at = time.time()
-    response = await _execute_chat_completion(openai_request, app_key_override=app_key)
+    response = await _execute_chat_completion(
+        openai_request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
     mark_model_active(profile.name)
     return _ollama_chat_response(response, started_at, stream=request.stream)
 
@@ -138,7 +146,11 @@ async def ollama_generate(
     _validate_chat_request(openai_request)
     app_key = _resolve_app_key(openai_request, http_request)
     started_at = time.time()
-    response = await _execute_chat_completion(openai_request, app_key_override=app_key)
+    response = await _execute_chat_completion(
+        openai_request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
     mark_model_active(profile.name)
     return _ollama_generate_response(response, started_at, stream=request.stream)
 
@@ -154,7 +166,11 @@ async def ollama_generate_scoped(
     _validate_chat_request(openai_request)
     app_key = _resolve_app_key(openai_request, http_request, endpoint_app_name=app_name)
     started_at = time.time()
-    response = await _execute_chat_completion(openai_request, app_key_override=app_key)
+    response = await _execute_chat_completion(
+        openai_request,
+        app_key_override=app_key,
+        http_request=http_request,
+    )
     mark_model_active(profile.name)
     return _ollama_generate_response(response, started_at, stream=request.stream)
 

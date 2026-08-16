@@ -102,6 +102,13 @@ class ClaudeSelectors:
         "input[type='file']",
     ]
 
+    ATTACHMENT_BADGE = [
+        "[data-testid*='attachment']",
+        "[class*='attachment']",
+        "button[aria-label*='Remove']",
+        "[data-testid*='file']",
+    ]
+
     # Attach / upload button (opens file picker)
     ATTACH_BUTTON = [
         "button[aria-label='Add files, connectors, and more']",

@@ -132,10 +132,18 @@ class Selectors:
 
     # ── File / attachment upload input ────────────────────────────
     FILE_UPLOAD_INPUT = [
-        "input#upload-photos",
+        "input[type='file']:not([accept*='image'])",
         "input[type='file']",
         "input[data-testid='file-upload']",
+        "input#upload-photos",
         "input[accept*='image']",
+    ]
+
+    ATTACHMENT_BADGE = [
+        "[data-testid*='attachment']",
+        "[class*='attachment']",
+        "button[aria-label*='Remove']",
+        "[data-testid*='file']",
     ]
 
     # Attach / upload button (opens file picker)

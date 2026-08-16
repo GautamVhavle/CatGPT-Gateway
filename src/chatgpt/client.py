@@ -8,6 +8,7 @@ Handles selector fallbacks and integrates human-like behavior.
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 import time
 
@@ -58,6 +59,14 @@ class ChatGPTClient:
     @property
     def page(self) -> Page:
         return self._page
+
+    def bind_page(self, page: Page | None) -> ChatGPTClient:
+        """Return a client bound to a specific tab without mutating this instance."""
+        if page is None or page is self._page:
+            return self
+        bound = copy.copy(self)
+        bound._page = page
+        return bound
 
     # ── Core: Send & Receive ────────────────────────────────────
 
@@ -114,10 +123,6 @@ class ChatGPTClient:
         # 2. Brief pause (human would take a moment to start typing)
         await random_delay(250, 700)
 
-        # 2.5. Upload files/images if provided
-        if all_attachments:
-            await self._upload_files(all_attachments)
-
         # 2. Find the chat input (retry once after dismissing overlays if not found)
         input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
         if not input_selector:
@@ -129,8 +134,12 @@ class ChatGPTClient:
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message (all at once)
+        # 3. Paste the message first so composer clear/delete cannot wipe attachments.
         await human_type(self._page, input_selector, text)
+
+        # 3.5. Attach files after text is in the composer.
+        if all_attachments:
+            await self._upload_files(all_attachments)
 
         # Small pause after pasting (like a human reviewing before send)
         await random_delay(300, 600)
@@ -2062,24 +2071,34 @@ class ChatGPTClient:
 
         log.info(f"Uploading {len(valid_paths)} file(s)...")
 
-        # Find the file input element — ChatGPT has a hidden <input type="file">
+        has_non_images = any(
+            Path(path).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+            for path in valid_paths
+        )
         file_input = None
-        for selector in Selectors.FILE_UPLOAD_INPUT:
-            try:
-                elements = await self._page.query_selector_all(selector)
-                if elements:
-                    file_input = elements[0]
-                    log.debug(f"Found file input: {selector}")
+        file_inputs = await self._page.query_selector_all("input[type='file']")
+        if has_non_images:
+            for candidate in file_inputs:
+                accept = (await candidate.get_attribute("accept") or "").lower()
+                if "image" not in accept or "*" in accept:
+                    file_input = candidate
+                    log.debug("Using general file input (accept=%r)", accept)
                     break
-            except Exception:
-                continue
+        if file_input is None:
+            for selector in Selectors.FILE_UPLOAD_INPUT:
+                try:
+                    elements = await self._page.query_selector_all(selector)
+                    if elements:
+                        file_input = elements[0]
+                        log.debug(f"Found file input: {selector}")
+                        break
+                except Exception:
+                    continue
 
         if file_input:
-            # Set files directly on the input element
             await file_input.set_input_files(valid_paths)
             log.info(f"Set {len(valid_paths)} file(s) on file input")
         else:
-            # Fallback: use page.set_input_files with a broad selector
             log.info("No file input found via selectors, trying broad input[type=file]")
             try:
                 await self._page.set_input_files("input[type='file']", valid_paths)
@@ -2088,11 +2107,19 @@ class ChatGPTClient:
                 log.error(f"Failed to upload files: {e}")
                 raise RuntimeError(f"Could not upload files: {e}")
 
-        # Wait for files to be processed/attached (thumbnails/badges appear)
-        await asyncio.sleep(3)
-        # Additional wait if multiple files
-        if len(valid_paths) > 1:
-            await asyncio.sleep(len(valid_paths))
+        badge_selector = ", ".join(Selectors.ATTACHMENT_BADGE)
+        try:
+            await self._page.wait_for_selector(
+                badge_selector,
+                timeout=8000,
+                state="attached",
+            )
+            log.info("Attachment badge detected in composer")
+        except Exception:
+            log.debug("Attachment badge wait timed out, using fallback sleep")
+            await asyncio.sleep(3)
+            if len(valid_paths) > 1:
+                await asyncio.sleep(len(valid_paths))
         log.info("File upload complete")
 
     def _extract_thread_id(self) -> str:

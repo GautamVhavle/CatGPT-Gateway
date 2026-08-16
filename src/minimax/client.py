@@ -52,6 +52,11 @@ class MiniMaxClient:
         self._messages: list[dict[str, str]] = []
         self._start_thread()
 
+    def bind_page(self, page: Any | None) -> MiniMaxClient:
+        """MiniMax is API-backed and does not use browser tabs."""
+        _ = page
+        return self
+
     async def send_message(
         self,
         text: str,

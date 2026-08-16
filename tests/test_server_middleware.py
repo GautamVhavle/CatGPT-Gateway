@@ -96,9 +96,17 @@ class BearerTokenMiddlewareTests(unittest.TestCase):
         )
         self.assertEqual(events[0]["status"], 204)
 
-    def test_rejects_missing_bearer_token(self) -> None:
-        events = asyncio.run(_call_middleware("/cline/v1/chat/completions"))
-        self.assertEqual(events[0]["status"], 401)
+    def test_accepts_x_api_key_header(self) -> None:
+        events = asyncio.run(
+            _call_middleware("/v1/chat/completions", {"x-api-key": "secret"})
+        )
+        self.assertEqual(events[0]["status"], 204)
+
+    def test_accepts_anthropic_api_key_header(self) -> None:
+        events = asyncio.run(
+            _call_middleware("/v1/messages", {"anthropic-api-key": "secret"})
+        )
+        self.assertEqual(events[0]["status"], 204)
 
     def test_optional_token_allows_missing_header(self) -> None:
         Config.API_TOKEN_OPTIONAL = True
