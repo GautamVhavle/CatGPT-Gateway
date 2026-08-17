@@ -1,25 +1,23 @@
-# ── Stage 1: Build ──────────────────────────────────────────────
-FROM python:3.14-slim AS base
+# ── Stage 1: Build CatGPT with jlesage/baseimage-gui ────────────
+FROM jlesage/baseimage-gui:debian-12-v4
 
-# Prevent interactive prompts during apt-get
+# Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Application settings for jlesage GUI
+RUN set-cont-env APP_NAME "CatGPT"
+ENV KEEP_APP_RUNNING=1
+
 # ── System dependencies ─────────────────────────────────────────
-# Xvfb: virtual framebuffer (fake display for headed Chrome)
-# x11vnc: VNC server to capture Xvfb display
-# noVNC + websockify: browser-based VNC client
-# Chrome deps: fonts, media, GL, sandbox support
-# supervisor: process manager
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Virtual display
-    xvfb \
-    # VNC
-    x11vnc \
-    # noVNC (browser-based VNC)
-    novnc websockify \
-    # Process manager
-    supervisor \
-    # Chrome runtime dependencies
+# Install Python, Chromium runtime libraries, fonts, and base tools with the
+# base image helper.  Installing these explicitly avoids Playwright's generic
+# apt bootstrap, which is incompatible with the minimized jlesage user/group
+# database.
+RUN add-pkg \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -39,14 +37,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libatspi2.0-0 \
     libwayland-client0 \
-    # Fonts (so pages render properly)
     fonts-liberation \
     fonts-noto-color-emoji \
     fonts-dejavu-core \
-    # Utilities
     curl \
     procps \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates
+
+# ── Python Virtual Environment ──────────────────────────────────
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 
 # ── Application setup ───────────────────────────────────────────
 WORKDIR /app
@@ -55,45 +57,41 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install patchright's Chromium browser
-RUN patchright install chromium && patchright install-deps chromium
+# Install Patchright's Chromium into a shared path that is identical during
+# the root build and the non-root jlesage application runtime.
+RUN patchright install chromium
 
-# Copy application code
+# Copy application source code and scripts
 COPY src/ src/
 COPY scripts/ scripts/
 
 # ── Directory setup ─────────────────────────────────────────────
-# These will be overridden by volume mounts in docker-compose
 RUN mkdir -p /app/browser_data /app/logs /app/downloads/images /app/downloads/audio
 
-# ── Supervisor & entrypoint ─────────────────────────────────────
-COPY docker/supervisord.conf /etc/supervisor/conf.d/catgpt.conf
-COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# ── GUI initialization & startup scripts ────────────────────────
+COPY docker/50-catgpt-init.sh /etc/cont-init.d/50-catgpt-init.sh
+COPY docker/startapp.sh /startapp.sh
+RUN chmod +x /etc/cont-init.d/50-catgpt-init.sh /startapp.sh
 
-# ── Environment ─────────────────────────────────────────────────
-# Virtual display
-ENV DISPLAY=:99
-ENV DISPLAY_WIDTH=1280
-ENV DISPLAY_HEIGHT=720
-ENV DISPLAY_DEPTH=24
-
-# App config (overridable via docker-compose)
+# ── App Environment Variables ───────────────────────────────────
 ENV HEADLESS=false
+ENV AUTO_LOGIN_INTERACTIVE=false
 ENV BROWSER_DATA_DIR=/app/browser_data
 ENV LOG_DIR=/app/logs
 ENV API_HOST=0.0.0.0
 ENV API_PORT=8000
 ENV LOG_LEVEL=DEBUG
 ENV VERBOSE=true
+ENV PYTHONPATH=/app
+ENV DISPLAY_WIDTH=1366
+ENV DISPLAY_HEIGHT=768
 
 # ── Ports ───────────────────────────────────────────────────────
 # 8000: FastAPI server
-# 6080: noVNC web UI
-EXPOSE 8000 6080
+# 5800: Web GUI (HTTP, or HTTPS when SECURE_CONNECTION=1)
+# 5900: VNC
+EXPOSE 8000 5800 5900
 
 # ── Health check ────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/v1/models || exit 1
-
-ENTRYPOINT ["/entrypoint.sh"]
+    CMD curl -f http://localhost:8000/healthz || curl -f http://localhost:8000/v1/models || exit 1

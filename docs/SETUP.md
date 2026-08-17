@@ -46,16 +46,16 @@ cp .env.example .env
 docker compose up --build -d
 
 # 5. First login (one-time) - open the browser UI
-open http://localhost:6080
+open http://localhost:5800
 # Sign into Claude or ChatGPT in the browser window you see
-# Close the noVNC tab when done - session is saved automatically
+# Close the web GUI tab when done - session is saved automatically
 
 # 6. Verify it works
-curl -H "Authorization: Bearer dummy123" http://localhost:8000/v1/models
+curl -H "Authorization: Bearer dummy123" http://localhost:8650/v1/models
 # {"object":"list","data":[{"id":"claude-browser",...}]}
 
 # 7. Send your first message
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost:8650/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer dummy123" \
   -d '{
@@ -72,11 +72,11 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   ```
   `docker restart catgpt` does NOT pick up code changes.
 
-- **Browser session persists** via the `catgpt_browser_data` Docker volume. You only need to log in once.
+- **Browser session persists** under `${DOCKERDIR}/appdata/catgpt/browser`. You only need to log in once.
 
-- **Logs** are bind-mounted to `./docker-logs/` on the host.
+- **Logs** are bind-mounted under `${DOCKERDIR}/appdata/catgpt/logs` on the host.
 
-- **noVNC** at `http://localhost:6080` lets you see and interact with the browser (useful for debugging, CAPTCHAs, or re-login). Default VNC password: `catgpt`.
+- **The jlesage web GUI** at `http://localhost:5800` lets you see and interact with the browser (useful for debugging, CAPTCHAs, or re-login). Default VNC password: `catgpt`.
 
 ---
 
@@ -151,7 +151,7 @@ CatGPT Gateway uses your existing browser session. You sign in **once** and the 
 
 1. Start the container: `docker compose up --build -d`
 2. Wait ~30 seconds for startup
-3. Open **http://localhost:6080/vnc.html** (noVNC) in your browser
+3. Open **http://localhost:5800** in your browser
 4. You'll see a Chromium browser inside the VNC viewer
 5. Sign into your provider using one of these methods:
    | Method | Works? |
@@ -162,7 +162,7 @@ CatGPT Gateway uses your existing browser session. You sign in **once** and the 
    | Magic link / OTP email | ✅ Works |
    | **Google / "Continue with Google"** | ❌ Blocked by Google |
 6. Verify you see the chat interface
-7. Close the noVNC tab — your session is saved in the `catgpt_browser_data` Docker volume and survives container restarts.
+7. Close the web GUI tab — your session is saved in the mounted browser directory and survives container restarts.
 
 ### Local
 
@@ -218,9 +218,9 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy123")
 
 To disable auth, set `API_TOKEN=` (empty string) in `.env`.
 
-### noVNC Password
+### Web GUI Password
 
-The noVNC browser UI at `http://localhost:6080` is password-protected.
+The jlesage browser UI at `http://localhost:5800` is password-protected.
 
 Default: `catgpt`. Change it via `VNC_PASSWORD` in `.env` or `docker-compose.yml`.
 
@@ -228,31 +228,31 @@ Default: `catgpt`. Change it via `VNC_PASSWORD` in `.env` or `docker-compose.yml
 
 ## Docker Internals
 
-### Container Services (managed by supervisord)
+### Container Services (managed by jlesage/baseimage-gui)
 
 | Service | Port | Purpose |
 |---|---|---|
-| Xvfb | `:99` | Virtual framebuffer. Chrome renders here. |
-| x11vnc | `5900` | VNC server capturing the Xvfb display |
-| noVNC | `6080` | WebSocket bridge. Browser-accessible VNC viewer. |
+| Web GUI | `5800` | HTTP by default; HTTPS on the same port if `SECURE_CONNECTION=1` |
+| Direct VNC | `5900` | Direct VNC client access (optional) |
 | FastAPI | `8000` | API server (OpenAI-compatible + custom REST) |
 
 ### Startup Sequence
 
-1. Create directories (`browser_data`, `logs`, `downloads/images`, `downloads/audio`)
-2. Clean stale Chrome lock files
-3. Set up VNC password
-4. Pre-resolve DNS domains and write to `/etc/hosts` (Docker DNS workaround)
-5. Verify Xvfb and Patchright Chromium
-6. Start supervisord (manages all 4 services)
+1. `50-catgpt-init.sh` runs as root after jlesage initializes the application user:
+   - Create and verify directories (`browser_data`, `logs`, `downloads/images`, `downloads/audio`)
+   - Clean stale Chrome lock files
+   - Pre-resolve DNS domains and write to `/etc/hosts` (Docker DNS workaround)
+2. `jlesage/baseimage-gui` initializes X server, Openbox window manager, TigerVNC, and the web GUI
+3. `/startapp.sh` launches `python3 -m src.api.server`
+4. FastAPI server starts Patchright Chromium in the active graphical display
 
 ### Volumes
 
 | Volume | Purpose |
 |---|---|
-| `catgpt_browser_data:/app/browser_data` | Persistent browser session (cookies, login) |
-| `./docker-logs:/app/logs` | Logs accessible from host |
-| `./downloads:/app/downloads` | Generated images and read-aloud audio accessible from host |
+| `${DOCKERDIR}/appdata/catgpt/config:/config` | jlesage GUI configuration, certificates, and user home |
+| `${DOCKERDIR}/appdata/catgpt/browser:/app/browser_data` | Persistent browser session (cookies, login) |
+| `${DOCKERDIR}/appdata/catgpt/logs:/app/logs` | Logs accessible from host |
 
 ### Health Check
 
@@ -313,7 +313,7 @@ cat logs/api_server.log            # Local
 ### "Not logged in" / session expired
 
 Re-login:
-- Docker: Open http://localhost:6080 and sign in
+- Docker: Open http://localhost:5800 and sign in
 - Local: Run `python scripts/first_login.py`
 
 ### Stale browser lock files

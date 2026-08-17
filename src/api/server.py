@@ -113,7 +113,7 @@ async def lifespan(app: FastAPI):
                     raise RuntimeError(f"Could not log in to {provider_name}")
                 log.warning(
                     "Login is still required, but startup is non-interactive. "
-                    "API will remain online while the user signs in through noVNC/VNC."
+                    "API will remain online while the user signs in through the web GUI/VNC."
                 )
             else:
                 session = await _browser.get_session_info()

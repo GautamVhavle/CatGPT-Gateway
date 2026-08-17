@@ -134,7 +134,7 @@ Quick reference for where to find things:
 | DOM selectors | `src/selectors.py`, `src/claude/selectors.py` |
 | Browser management | `src/browser/manager.py` |
 | Configuration | `src/config.py` |
-| Docker setup | `docker/entrypoint.sh`, `docker/supervisord.conf` |
+| Docker setup | `docker/10-catgpt-init.sh`, `docker/startapp.sh`, `docker/Dockerfile` |
 | Tests | `scripts/test_*.py` |
 | Documentation | `docs/` |
 

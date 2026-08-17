@@ -57,17 +57,17 @@ await context.close()
 await pw.stop()
 ```
 
-## Docker and noVNC Login
-
-In Docker, use the browser exposed through noVNC:
-
+## Docker Web GUI Login
+ 
+In Docker, use the browser exposed through the jlesage Web GUI:
+ 
 ```text
-http://localhost:6080/vnc.html
+http://localhost:5800
 ```
-
-The API process is non-interactive under supervisor, so it should not wait for
-terminal input. If login is required, sign in through noVNC and then check:
-
+ 
+The API process is non-interactive in the container, so it will not wait for
+terminal input. If login is required, sign in through the Web GUI and then check:
+ 
 ```bash
 curl http://localhost:8000/status
 ```

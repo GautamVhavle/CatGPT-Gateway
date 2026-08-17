@@ -1,0 +1,35 @@
+name: Docker Build Check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/docker-build.yml"
+      - ".dockerignore"
+      - "docker/**"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "scripts/**"
+      - "src/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

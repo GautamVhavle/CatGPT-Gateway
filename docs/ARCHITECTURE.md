@@ -255,24 +255,25 @@ Both clients expose the same interface. The API layer (`openai_routes.py`) uses 
 ## Docker Stack
 
 ```
-Docker Container
+Docker Container (jlesage/baseimage-gui:debian-12)
 |
-|-- Xvfb (:99)           Virtual framebuffer, Chrome renders here
-|-- x11vnc (:5900)       VNC server capturing the Xvfb display
-|-- noVNC (:6080)        WebSocket bridge for browser-based VNC access
-+-- FastAPI (:8000)      API server
+|-- TigerVNC / Xvnc      Virtual display + VNC server
+|-- Openbox              Lightweight window manager (proper dialog/popup framing)
+|-- Web GUI (:5800)      HTML5 web access with sidebar, clipboard sync & settings
++-- FastAPI (:8000)      API server (launched via /startapp.sh)
 |
-+-- All managed by supervisord
++-- Initialization managed by /etc/cont-init.d/50-catgpt-init.sh
 ```
 
-### Startup Sequence (entrypoint.sh)
+### Startup Sequence
 
-1. Create directories
-2. Clean stale Chrome lock files
-3. Set up VNC password from `VNC_PASSWORD` env var
-4. Pre-resolve DNS domains via Python, write to `/etc/hosts`
-5. Verify Xvfb and Patchright Chromium
-6. Start supervisord (all 4 services)
+1. `50-catgpt-init.sh` (cont-init, after jlesage user initialization):
+   - Prepare runtime directories
+   - Clean stale Chrome lock files
+   - Pre-resolve DNS domains via Python, write to `/etc/hosts`
+2. `baseimage-gui` init initializes X server, Openbox, TigerVNC, and Web GUI
+3. `/startapp.sh` executes `python3 -m src.api.server`
+4. FastAPI server launches and manages Patchright Chromium
 
 ### Tech Stack
 
@@ -287,5 +288,4 @@ Docker Container
 | Rich text | Rich | Markdown rendering |
 | Config | python-dotenv | Environment variable loading |
 | Container | Docker + Compose | Production deployment |
-| Display server | Xvfb + x11vnc + noVNC | Virtual display + browser access |
-| Process manager | supervisord | Manage container services |
+| Base GUI Image | jlesage/baseimage-gui | TigerVNC + Openbox + HTML5 Web GUI |

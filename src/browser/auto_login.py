@@ -22,7 +22,7 @@ def can_prompt_for_login() -> bool:
     """
     Return true when this process can safely block for terminal input.
 
-    Docker/supervisor deployments expose the browser through noVNC, but the API
+    Docker/supervisor deployments expose the browser through a web GUI, but the API
     process itself is non-interactive. In that mode startup must not wait on
     input(), because nobody can answer it.
     """
@@ -83,7 +83,7 @@ async def ensure_logged_in(browser: BrowserManager, has_session: bool = False) -
     if not can_prompt_for_login():
         log.warning(
             "Login required, but stdin is not interactive. "
-            "Leaving browser open for VNC/noVNC login."
+            "Leaving browser open for web GUI/VNC login."
         )
         return False
 

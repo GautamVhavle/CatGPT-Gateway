@@ -34,7 +34,7 @@ This version supports:
 | App-scoped routes such as `/mealie/v1/chat/completions` | Yes |
 | App-thread isolation using request identity | Yes |
 | Model switching for current ChatGPT picker models | Yes |
-| noVNC browser login UI | Yes |
+| Browser-based GUI for login and recovery | Yes |
 
 The default browser-backed model id is `catgpt-browser`. You can also request
 specific ChatGPT picker models listed below.
@@ -61,6 +61,8 @@ cd catgpt
 export DOCKERDIR=/path/to/docker
 export CATGPT_API_KEY=change-this-api-token
 export CATGPT_VNC_PASSWORD=change-this-vnc-password
+export CATGPT_USER_ID=1000
+export CATGPT_GROUP_ID=1000
 ```
 
 If you prefer a `.env` file beside `docker-compose.yml`:
@@ -69,6 +71,8 @@ If you prefer a `.env` file beside `docker-compose.yml`:
 DOCKERDIR=/path/to/docker
 CATGPT_API_KEY=change-this-api-token
 CATGPT_VNC_PASSWORD=change-this-vnc-password
+CATGPT_USER_ID=1000
+CATGPT_GROUP_ID=1000
 ```
 
 3. Start CatGPT.
@@ -82,7 +86,7 @@ docker compose up -d
 Open:
 
 ```text
-http://localhost:6080
+http://localhost:5800
 ```
 
 Enter the VNC password from `CATGPT_VNC_PASSWORD`, then log in to ChatGPT inside
@@ -161,9 +165,11 @@ environment:
 
 | Variable | Example | Purpose |
 | --- | --- | --- |
-| `DOCKERDIR` | `/mnt/user/appdata` | Host root for persisted browser data and logs |
+| `DOCKERDIR` | `/mnt/user/appdata` | Host root for persisted jlesage config, browser data, and logs |
 | `CATGPT_API_KEY` | `change-me` | Value passed into container as `API_TOKEN` |
 | `CATGPT_VNC_PASSWORD` | `change-me` | Value passed into container as `VNC_PASSWORD` |
+| `CATGPT_USER_ID` | `1000` | User ID used by the jlesage application process |
+| `CATGPT_GROUP_ID` | `1000` | Group ID used by the jlesage application process |
 
 ### Browser and provider
 
@@ -172,14 +178,13 @@ environment:
 | `PROVIDER` | `chatgpt` | Browser provider. Use `chatgpt` for CatGPT; `claude` is also wired in the codebase. |
 | `CHATGPT_URL` | `https://chatgpt.com` | ChatGPT URL to open. |
 | `CLAUDE_URL` | `https://claude.ai` | Claude URL when `PROVIDER=claude`. |
-| `HEADLESS` | `false` | Keep `false` for Docker/noVNC. |
+| `HEADLESS` | `false` | Keep `false` for the Docker web GUI. |
+| `AUTO_LOGIN_INTERACTIVE` | `false` in Docker | Keep the API online while login is completed through the web GUI. |
 | `BROWSER_CHANNEL` | `chrome` | Browser channel. Use `chromium` to force bundled Chromium. |
 | `BROWSER_DATA_DIR` | `browser_data` | Persistent browser profile path inside the container. |
 | `SLOW_MO` | `25` | Browser automation delay in milliseconds. |
-| `DISPLAY` | `:99` | X display used by the container. |
 | `DISPLAY_WIDTH` | `1366` in compose | Virtual display width. |
 | `DISPLAY_HEIGHT` | `768` in compose | Virtual display height. |
-| `DISPLAY_DEPTH` | `24` in compose | Virtual display depth. |
 
 ### Model switching
 
@@ -237,7 +242,7 @@ environment:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `VNC_PASSWORD` | `catgpt` | Password for `http://localhost:6080`. |
+| `VNC_PASSWORD` | `catgpt` | Password for the web GUI at `http://localhost:5800`. |
 | `LOG_LEVEL` | `DEBUG` | Python logging level. |
 | `VERBOSE` | `true` | Log to console as well as files. |
 
@@ -340,8 +345,8 @@ threads.
 | Problem | Fix |
 | --- | --- |
 | API says the browser is not initialized | Wait 30-60 seconds after container start, then check `docker logs catgpt --tail 100`. |
-| Login expired | Open `http://localhost:6080` and log in again. |
-| noVNC opens but ChatGPT is logged out | Log in inside noVNC; the profile persists in the mounted browser volume. |
+| Login expired | Open `http://localhost:5800` and log in again. |
+| Web GUI opens but ChatGPT is logged out | Log in inside the web GUI; the profile persists in the mounted browser volume. |
 | Model switch fails | Check `/v1/models`, then update `CHATGPT_MODEL_ALIASES` or set `CHATGPT_MODEL_SWITCH_STRICT=false`. |
 | A code change is not visible | Run `docker compose up --build -d`. |
 | Browser profile is stuck | Stop the container and remove stale browser lock files from the mounted browser directory. |
