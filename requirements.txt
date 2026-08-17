@@ -4,20 +4,20 @@ playwright-stealth>=2.0.3
 
 # TUI (Phase 2)
 textual>=8.2.8
-typer>=0.26.8
+typer>=0.27.1
 rich>=15.0.0
 
 # API (Phase 3)
-fastapi>=0.139.0
-uvicorn>=0.50.2
+fastapi>=0.141.1
+uvicorn>=0.52.3
 
 # Data & Config
 pydantic>=2.13.4
 python-dotenv>=1.2.2
 Pillow>=12.3.0
-PyMuPDF>=1.28.0
+PyMuPDF>=1.28.2
 
 # OpenAI-compatible testing
-openai>=2.44.0
-langchain-openai>=1.3.3
-langchain>=1.3.11
+openai>=3.0.0
+langchain-openai>=1.5.0
+langchain>=1.3.15
