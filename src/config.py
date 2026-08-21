@@ -36,9 +36,10 @@ class Config:
     LOG_DIR: Path = _PROJECT_ROOT / os.getenv("LOG_DIR", "logs")
     IMAGES_DIR: Path = _PROJECT_ROOT / os.getenv("IMAGES_DIR", "downloads/images")
 
-    # Browser
+    # Browser & Concurrency
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
     SLOW_MO: int = int(os.getenv("SLOW_MO", "25"))
+    MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
     MINIMAX_BASE_URLS: dict[str, str] = {
@@ -156,8 +157,19 @@ class Config:
         return cls.PROVIDER == "chatgpt"
 
     # Timeouts (ms)
-    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))
+    # RESPONSE_TIMEOUT: how long to wait for ChatGPT to finish generating.
+    # Default is 20 minutes (1 200 000 ms) because deep-thinking / reasoning
+    # models (o1, o3, o3-mini) can take 10-20 minutes for complex tasks.
+    # Override via RESPONSE_TIMEOUT env var if you need a shorter limit.
+    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "1200000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
+
+    # Maximum number of active browser tabs held open for persistent sessions.
+    # When this limit is reached the least-recently-used idle tab is closed
+    # (its conversation URL is preserved and the tab is reopened transparently
+    # on the next request for that session).
+    # Increase for more parallelism at the cost of more RAM.
+    MAX_ACTIVE_TABS: int = int(os.getenv("MAX_ACTIVE_TABS", "4"))
 
     # Human simulation (ms)
     TYPING_SPEED_MIN: int = int(os.getenv("TYPING_SPEED_MIN", "50"))

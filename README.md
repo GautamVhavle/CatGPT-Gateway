@@ -57,10 +57,14 @@ That's it. Your Claude or ChatGPT subscription just became an API.
 | Feature | Claude | ChatGPT |
 |---|:---:|:---:|
 | Chat completions | Yes | Yes |
+| SSE Streaming (`stream=true`) | Yes | Yes |
+| Multi-tab Concurrency (`BrowserPagePool`) | Yes | Yes |
+| Persistent Sessions (`x-session-id`) | Yes | Yes |
+| Live Multi-Tab Web Monitor (`/preview`) | Yes | Yes |
 | Multi-turn conversations | Yes | Yes |
 | Tool / function calling | Yes | Yes |
 | Image input (vision) | Yes | Yes |
-| File attachments (PDF, DOCX, etc.) | Yes | Yes |
+| File attachments (PDF, DOCX, CSV, etc.) | Yes | Yes |
 | Image generation (DALL-E) | -- | Yes |
 | Interactive TUI (terminal chat) | Yes | Yes |
 | OpenAI SDK compatible | Yes | Yes |
@@ -156,10 +160,27 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy123")
 
 # Simple chat
 response = client.chat.completions.create(
-    model="claude-browser",
+    model="catgpt-browser",
     messages=[{"role": "user", "content": "Explain quantum computing in simple terms"}]
 )
 print(response.choices[0].message.content)
+
+# Real-time SSE streaming (stream=True)
+stream = client.chat.completions.create(
+    model="catgpt-browser",
+    messages=[{"role": "user", "content": "Write a short story about an AI assistant"}],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+
+# Persistent session (avoids page reload / CAPTCHAs across turns)
+res = client.chat.completions.create(
+    model="catgpt-browser",
+    messages=[{"role": "user", "content": "My secret code is 9527"}],
+    extra_headers={"x-session-id": "my-session-01"},
+)
 ```
 
 ### Python (LangChain)
@@ -310,12 +331,19 @@ Tool calling is implemented via prompt engineering: tool definitions are injecte
 
 ---
 
+## Live Multi-Tab Monitor
+
+When the gateway is running, open **`http://localhost:8000/preview`** in any browser to access the real-time visual dashboard:
+- **Zero-Flicker Grid**: Double-buffered real-time preview of all concurrent browser tabs.
+- **Tab Management**: Switch between active tabs or safely close specific tabs.
+- **i18n Support**: Auto-detects system language with instant English / Chinese toggle.
+
+---
+
 ## Known Limitations
 
-- **No streaming** - Responses are returned all at once after completion. `stream=true` returns a 400 error.
-- **Single concurrency** - One request at a time (browser is single-threaded). Requests are queued.
 - **Response time** - Each request takes 5-30s depending on response length (real browser round-trip).
-- **Session expiry** - Browser sessions expire after days/weeks. Re-login via noVNC or `first_login.py`.
+- **Session expiry** - Browser sessions expire after days/weeks. Re-login via `./login.sh` or `first_login.py`.
 - **UI changes** - If Claude or ChatGPT update their HTML, selectors may need updating. All selectors are centralized in `selectors.py` for easy fixes.
 - **Tool calling** - Works via prompt engineering, not native API. Reliable for 1-7 tools. Very complex schemas may occasionally need a retry.
 

@@ -211,16 +211,23 @@ class BrowserManager:
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
-            # Disable Chrome's built-in DNS client entirely.  Even with
-            # AsyncDns off, Chrome's stub resolver can return NXDOMAIN for
-            # domains the OS resolves fine.  We also pre-resolve domains
-            # via --host-resolver-rules (see _resolve_domains_for_chrome).
+            "--test-type",
+            # Disable Chrome's built-in DNS client entirely.
             "--disable-features=AsyncDns,DnsOverHttps",
             "--dns-prefetch-disable",
+            # Suppress "Restore pages?" crash-recovery popup and force
+            # Chrome NOT to restore the previous session on any restart.
+            # This prevents the browser from stealing focus by showing the
+            # restore dialog after a server/agent crash.
+            "--hide-crash-restore-bubble",
+            "--restore-last-session=0",
+            "--disable-session-crashed-bubble",
+            "--no-restore-on-browser-startup",
         ]
 
-        # Docker-specific flags
-        if os.path.exists("/.dockerenv") or os.environ.get("DISPLAY") == ":99":
+        # Docker or virtual display (Xvfb) flags
+        display = os.environ.get("DISPLAY", "")
+        if os.path.exists("/.dockerenv") or ":99" in display or not display:
             chrome_args.extend([
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -499,6 +506,18 @@ class BrowserManager:
         except Exception as e:
             log.error(f"Login check error: {e}")
             return False
+
+    @property
+    def context(self) -> BrowserContext | None:
+        """Return the active browser context."""
+        return self._context
+
+    async def new_page(self) -> Page:
+        """Create a new page in the existing persistent context."""
+        if self._context is None:
+            raise RuntimeError("Browser context is not initialized")
+        page = await self._context.new_page()
+        return page
 
     async def close(self) -> None:
         """Gracefully close the browser context and playwright instance."""
