@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import re
+import tempfile
 import time
+from pathlib import Path
+from typing import Literal
 
 from patchright.async_api import Page
 
@@ -35,9 +39,13 @@ from src.chatgpt.detector import (
 from src.chatgpt.image_handler import extract_images_from_response
 from src.chatgpt.audio_handler import generate_read_aloud_audio
 from src.chatgpt.models import ChatResponse
+from src.chatgpt.errors import PromptAttachmentFallbackError, PromptTooLongError
 from src.log import setup_logging
 
 log = setup_logging("chatgpt_client")
+
+SendButtonState = Literal["clicked", "disabled", "missing"]
+PromptSubmissionState = Literal["ready", "prompt-too-long", "disabled", "unknown"]
 
 
 class ChatGPTClient:
@@ -99,6 +107,7 @@ class ChatGPTClient:
         Returns ChatResponse with the assistant's reply and metadata.
         """
         all_attachments = (image_paths or []) + (file_paths or [])
+        temporary_prompt_path: str | None = None
         log.info(f"Sending message ({len(text)} chars, {len(all_attachments)} attachments): {text[:80]}...")
         start_time = time.time()
 
@@ -134,157 +143,191 @@ class ChatGPTClient:
         if not input_selector:
             raise RuntimeError("Could not find chat input element")
 
-        # 3. Paste the message first so composer clear/delete cannot wipe attachments.
-        await human_type(self._page, input_selector, text)
+        submitted_text = text
+        try:
+            # 3. Paste the message first so composer clear/delete cannot wipe attachments.
+            await human_type(self._page, input_selector, text)
 
-        # 3.5. Attach files after text is in the composer.
-        if all_attachments:
-            await self._upload_files(all_attachments)
-
-        # Small pause after pasting (like a human reviewing before send)
-        await random_delay(300, 600)
-
-        auto_submitted = False
-        sent = False
-        if auto_submitted:
-            log.info("ChatGPT auto-submitted after text entry — skipping send button click")
-        else:
-            # No auto-submit — click the send button
-            log.info("No auto-submit detected, clicking send button")
-            sent = await self._click_send()
-            if not sent:
-                log.info("Send button not found, trying Enter key")
-                await self._page.keyboard.press("Enter")
-
-        submitted = await self._wait_for_message_submission(pre_user_signature, text)
-        if not submitted:
-            diagnostic_path = await capture_response_diagnostics(
-                self._page,
-                "message-not-submitted",
-                previous_turn_signature=pre_turn_signature,
-                extra={
-                    "recent_backend_events": self._backend_events_snapshot(),
-                    "prompt_length": len(text),
-                    "sent_by_button": sent,
-                },
-            )
-            detail = "Message was not submitted to ChatGPT"
-            if diagnostic_path:
-                detail = f"{detail}; diagnostic={diagnostic_path}"
-            raise RuntimeError(detail)
-
-        # 5. Wait for response with message count awareness
-        log.info("Waiting for ChatGPT response...")
-        expected_count = pre_count + 1
-        completed = await wait_for_response_complete(
-            self._page,
-            expected_msg_count=expected_count,
-            previous_turn_signature=pre_turn_signature,
-        )
-
-        if not completed:
-            log.warning("Response may not be complete (timeout)")
-            await capture_response_diagnostics(
-                self._page,
-                "response-timeout",
-                previous_turn_signature=pre_turn_signature,
-                extra={
-                    "recent_backend_events": self._backend_events_snapshot(),
-                    "prompt_length": len(text),
-                    "expected_assistant_count": expected_count,
-                },
-            )
-
-        # Small buffer after completion to let DOM settle
-        await asyncio.sleep(1.0)
-
-        # 6. Check for generated images in the response FIRST
-        #    (image turns have no copy button, so we must detect images
-        #    before trying copy-button extraction)
-        images = await extract_images_from_response(
-            self._page,
-            previous_turn_signature=pre_turn_signature,
-        )
-        has_images = len(images) > 0
-
-        # 7. Extract text content
-        if has_images:
-            # Image responses don't have a copy button — extract text
-            # from the turn's DOM instead (will get the image title/desc)
-            response_text = await self._extract_image_turn_text(pre_turn_signature)
-            log.info(f"Response contains {len(images)} generated image(s)")
-            for img in images:
-                log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
-        else:
-            # Standard text response — use copy button (most reliable)
-            response_text = await extract_last_response_via_copy(
-                self._page,
-                previous_turn_signature=pre_turn_signature,
-            )
-
-            # ChatGPT can briefly expose status text like "thinking" as a turn.
-            # Retry against the same new turn before giving that transient text back.
-            if is_incomplete_response_text(response_text):
-                log.warning("Extracted text looks incomplete/transient; retrying for final answer")
-                for attempt in range(1, 3):
-                    await asyncio.sleep(2)
-                    await wait_for_response_complete(
-                        self._page,
-                        timeout_ms=90000,
-                        previous_turn_signature=pre_turn_signature,
-                    )
-                    retry_text = await extract_last_response_via_copy(
-                        self._page,
-                        previous_turn_signature=pre_turn_signature,
+            prompt_state = await self._prompt_submission_state(text)
+            if prompt_state == "prompt-too-long":
+                if Config.CHATGPT_LONG_PROMPT_FALLBACK != "attachment":
+                    raise PromptTooLongError(
+                        "ChatGPT rejected the prompt as too long and the attachment fallback is disabled"
                     )
 
-                    if retry_text and not is_incomplete_response_text(retry_text):
-                        response_text = retry_text
-                        log.info(f"Recovered final response text on retry {attempt}")
-                        break
+                temporary_prompt_path = self._create_prompt_attachment(text)
+                attachment_name = Path(temporary_prompt_path).name
+                submitted_text = (
+                    f"Read the attached file `{attachment_name}` as the complete user request. "
+                    "Follow its instructions exactly and use all of its content before answering."
+                )
+                log.info(
+                    "Prompt is too long for the ChatGPT composer; using attachment fallback (%s)",
+                    attachment_name,
+                )
+                await human_type(self._page, input_selector, submitted_text)
+                all_attachments = [*all_attachments, temporary_prompt_path]
 
-                    if retry_text:
-                        response_text = retry_text
-                    log.warning(f"Retry {attempt} still incomplete/transient")
+            # 3.5. Attach files after text is in the composer.
+            if all_attachments:
+                await self._upload_files(all_attachments)
 
-            if not response_text or is_incomplete_response_text(response_text):
-                await capture_response_diagnostics(
+            # Small pause after pasting (like a human reviewing before send)
+            await random_delay(300, 600)
+
+            auto_submitted = False
+            sent = False
+            if auto_submitted:
+                log.info("ChatGPT auto-submitted after text entry — skipping send button click")
+            else:
+                # No auto-submit — click the send button
+                log.info("No auto-submit detected, clicking send button")
+                send_state = await self._click_send()
+                sent = send_state == "clicked"
+                if send_state == "missing":
+                    log.info("Send button not found, trying Enter key")
+                    await self._page.keyboard.press("Enter")
+                elif send_state == "disabled":
+                    log.warning("Send button is disabled; refusing to submit with Enter")
+                    raise RuntimeError("ChatGPT send button is disabled; message was not submitted")
+
+            submitted = await self._wait_for_message_submission(pre_user_signature, submitted_text)
+            if not submitted:
+                diagnostic_path = await capture_response_diagnostics(
                     self._page,
-                    "empty-or-incomplete-response",
+                    "message-not-submitted",
                     previous_turn_signature=pre_turn_signature,
                     extra={
                         "recent_backend_events": self._backend_events_snapshot(),
                         "prompt_length": len(text),
-                        "has_images": has_images,
+                        "sent_by_button": sent,
+                        "prompt_submission_state": prompt_state,
                     },
                 )
+                detail = "Message was not submitted to ChatGPT"
+                if diagnostic_path:
+                    detail = f"{detail}; diagnostic={diagnostic_path}"
+                raise RuntimeError(detail)
 
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        thread_id = self._extract_thread_id()
-        audio = None
-
-        if read_aloud and response_text:
-            audio = await generate_read_aloud_audio(
+            # 5. Wait for response with message count awareness
+            log.info("Waiting for ChatGPT response...")
+            expected_count = pre_count + 1
+            completed = await wait_for_response_complete(
                 self._page,
+                expected_msg_count=expected_count,
                 previous_turn_signature=pre_turn_signature,
             )
 
-        log.info(
-            f"Response received ({elapsed_ms}ms, {len(response_text)} chars"
-            f"{f', {len(images)} images' if has_images else ''}"
-            f"{', audio' if audio else ''}): "
-            f"{response_text[:80]}..."
-        )
+            if not completed:
+                log.warning("Response may not be complete (timeout)")
+                await capture_response_diagnostics(
+                    self._page,
+                    "response-timeout",
+                    previous_turn_signature=pre_turn_signature,
+                    extra={
+                        "recent_backend_events": self._backend_events_snapshot(),
+                        "prompt_length": len(text),
+                        "expected_assistant_count": expected_count,
+                    },
+                )
 
-        return ChatResponse(
-            message=response_text,
-            thread_id=thread_id,
-            response_time_ms=elapsed_ms,
-            images=images,
-            has_images=has_images,
-            audio=audio,
-            has_audio=audio is not None,
-        )
+            # Small buffer after completion to let DOM settle
+            await asyncio.sleep(1.0)
+
+            # 6. Check for generated images in the response FIRST
+            #    (image turns have no copy button, so we must detect images
+            #    before trying copy-button extraction)
+            images = await extract_images_from_response(
+                self._page,
+                previous_turn_signature=pre_turn_signature,
+            )
+            has_images = len(images) > 0
+
+            # 7. Extract text content
+            if has_images:
+                # Image responses don't have a copy button — extract text
+                # from the turn's DOM instead (will get the image title/desc)
+                response_text = await self._extract_image_turn_text(pre_turn_signature)
+                log.info(f"Response contains {len(images)} generated image(s)")
+                for img in images:
+                    log.info(f"  Image: {img.alt or img.prompt_title} → {img.local_path}")
+            else:
+                # Standard text response — use copy button (most reliable)
+                response_text = await extract_last_response_via_copy(
+                    self._page,
+                    previous_turn_signature=pre_turn_signature,
+                )
+
+                # ChatGPT can briefly expose status text like "thinking" as a turn.
+                # Retry against the same new turn before giving that transient text back.
+                if is_incomplete_response_text(response_text):
+                    log.warning("Extracted text looks incomplete/transient; retrying for final answer")
+                    for attempt in range(1, 3):
+                        await asyncio.sleep(2)
+                        await wait_for_response_complete(
+                            self._page,
+                            timeout_ms=90000,
+                            previous_turn_signature=pre_turn_signature,
+                        )
+                        retry_text = await extract_last_response_via_copy(
+                            self._page,
+                            previous_turn_signature=pre_turn_signature,
+                        )
+
+                        if retry_text and not is_incomplete_response_text(retry_text):
+                            response_text = retry_text
+                            log.info(f"Recovered final response text on retry {attempt}")
+                            break
+
+                        if retry_text:
+                            response_text = retry_text
+                        log.warning(f"Retry {attempt} still incomplete/transient")
+
+                if not response_text or is_incomplete_response_text(response_text):
+                    await capture_response_diagnostics(
+                        self._page,
+                        "empty-or-incomplete-response",
+                        previous_turn_signature=pre_turn_signature,
+                        extra={
+                            "recent_backend_events": self._backend_events_snapshot(),
+                            "prompt_length": len(text),
+                            "has_images": has_images,
+                        },
+                    )
+
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            thread_id = self._extract_thread_id()
+            audio = None
+
+            if read_aloud and response_text:
+                audio = await generate_read_aloud_audio(
+                    self._page,
+                    previous_turn_signature=pre_turn_signature,
+                )
+
+            log.info(
+                f"Response received ({elapsed_ms}ms, {len(response_text)} chars"
+                f"{f', {len(images)} images' if has_images else ''}"
+                f"{', audio' if audio else ''}): "
+                f"{response_text[:80]}..."
+            )
+
+            return ChatResponse(
+                message=response_text,
+                thread_id=thread_id,
+                response_time_ms=elapsed_ms,
+                images=images,
+                has_images=has_images,
+                audio=audio,
+                has_audio=audio is not None,
+            )
+        finally:
+            if temporary_prompt_path:
+                try:
+                    Path(temporary_prompt_path).unlink(missing_ok=True)
+                    log.debug("Removed temporary long-prompt attachment: %s", temporary_prompt_path)
+                except OSError as exc:
+                    log.warning("Could not remove temporary long-prompt attachment %s: %s", temporary_prompt_path, exc)
 
     async def generate_image(
         self,
@@ -737,6 +780,55 @@ class ChatGPTClient:
         """Return the current browser/page error state, if one is visible."""
         return await _check_page_error(self._page)
 
+    async def _prompt_submission_state(self, text: str) -> PromptSubmissionState:
+        """Classify the composer before attachments and submission."""
+        if Config.CHATGPT_LONG_PROMPT_THRESHOLD and len(text) >= Config.CHATGPT_LONG_PROMPT_THRESHOLD:
+            return "prompt-too-long"
+
+        await asyncio.sleep(0.15)
+        state = await self._composer_state()
+        if not state:
+            return "unknown"
+        if state.get("promptTooLong"):
+            return "prompt-too-long"
+
+        send_button = state.get("sendButton")
+        if isinstance(send_button, dict) and (
+            send_button.get("disabled")
+            or str(send_button.get("ariaDisabled") or "").lower() == "true"
+        ):
+            # ChatGPT currently does not always render a validation message for
+            # oversized prompts. In the live UI it leaves the populated
+            # composer intact and sets aria-disabled="true" on Send. Treat that
+            # stable, non-generating state as the same prompt-too-long signal so
+            # the attachment fallback can run. An active response can also
+            # disable Send, so keep that case distinct.
+            if str(state.get("composerText") or "").strip() and not state.get("hasStopButton"):
+                return "prompt-too-long"
+            return "disabled"
+        return "ready"
+
+    @staticmethod
+    def _create_prompt_attachment(text: str) -> str:
+        """Persist a prompt as a UTF-8 temporary file for ChatGPT upload."""
+        file_descriptor, filename = tempfile.mkstemp(
+            prefix="catgpt-long-prompt-",
+            suffix=".txt",
+        )
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+        except Exception as exc:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+            Path(filename).unlink(missing_ok=True)
+            raise PromptAttachmentFallbackError(
+                f"Could not create the temporary prompt attachment: {exc}"
+            ) from exc
+        return filename
+
     async def _wait_for_message_submission(
         self,
         previous_user_signature: str | None,
@@ -781,7 +873,7 @@ class ChatGPTClient:
         return False
 
     async def _composer_state(self) -> dict:
-        """Read composer/stop-button state from the page."""
+        """Read composer, validation, and send-button state from the page."""
         try:
             state = await self._page.evaluate(
                 """
@@ -805,9 +897,46 @@ class ChatGPTClient:
                         'button[aria-label="Stop generating"]',
                         'button[aria-label*="stop" i]'
                     ].join(',');
+                    const sendSelectors = [
+                        'button[data-testid="send-button"]',
+                        '#composer-submit-button',
+                        "button[aria-label='Send prompt']",
+                    ];
+                    let sendButton = null;
+                    for (const selector of sendSelectors) {
+                        const candidate = document.querySelector(selector);
+                        if (candidate) {
+                            sendButton = {
+                                selector,
+                                disabled: Boolean(candidate.disabled),
+                                ariaDisabled: candidate.getAttribute('aria-disabled'),
+                                visible: isVisible(candidate),
+                            };
+                            break;
+                        }
+                    }
+                    const validationNodes = Array.from(document.querySelectorAll(
+                        '[role="alert"], [aria-live], [data-state="error"], [class*="error" i], [class*="alert" i]'
+                    ));
+                    const validationText = validationNodes
+                        .filter(isVisible)
+                        .map(textOf)
+                        .filter(Boolean)
+                        .join(' ')
+                        .slice(-2000);
+                    // The composer and its toast/validation area are normally
+                    // near the end of body text. Limiting this avoids treating
+                    // an old error in conversation history as current state.
+                    const visibleText = ((document.body && document.body.innerText) || '').slice(-4000);
+                    const promptTooLong = /(?:message|prompt|input).{0,50}too long|too long.{0,50}(?:message|prompt|input)|(?:exceed|exceeds|maximum).{0,50}(?:character|token|length|limit)|(?:character|token|length).{0,50}(?:limit|maximum)/i.test(
+                        `${validationText} ${visibleText}`
+                    );
                     return {
                         composerText: textOf(composer),
                         hasStopButton: Array.from(document.querySelectorAll(stopSelector)).some(isVisible),
+                        sendButton,
+                        validationText,
+                        promptTooLong,
                     };
                 }
                 """
@@ -904,8 +1033,8 @@ class ChatGPTClient:
         except Exception as e:
             log.debug(f"Overlay check failed: {e}")
 
-    async def _click_send(self) -> bool:
-        """Try to click the send button using selector fallbacks."""
+    async def _click_send(self) -> SendButtonState:
+        """Try to click Send, distinguishing disabled from missing controls."""
         # Check send button state before clicking
         btn_state = await self._page.evaluate(
             """
@@ -934,16 +1063,19 @@ class ChatGPTClient:
         log.debug(f"Send button state: {btn_state}")
 
         # Don't click a disabled send button — the input wasn't recognized
-        if isinstance(btn_state, dict) and btn_state.get("disabled"):
-            log.warning("Send button is disabled — text may not have been inserted properly")
-            return False
+        if isinstance(btn_state, dict) and (
+            btn_state.get("disabled")
+            or str(btn_state.get("ariaDisabled") or "").lower() == "true"
+        ):
+            log.warning("Send button is disabled — refusing to submit with Enter")
+            return "disabled"
 
         selector = await self._find_selector(Selectors.SEND_BUTTON, "send button")
         if selector:
             await human_click(self._page, selector)
             log.info(f"Send button clicked via: {selector}")
-            return True
-        return False
+            return "clicked"
+        return "missing"
 
     async def _detect_current_model_label(self) -> str:
         """Best-effort detection of the currently selected ChatGPT model label."""

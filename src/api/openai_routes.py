@@ -63,6 +63,7 @@ from src.api.browser_gate import (
     browser_access_lock,
 )
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.errors import PromptAttachmentFallbackError, PromptTooLongError
 from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
 from src.chatgpt.model_registry import (
@@ -2533,6 +2534,12 @@ async def _execute_chat_completion(
                 else:
                     send_kwargs["stateless"] = True
                 result = await client.send_message(prompt, **send_kwargs)
+            except PromptTooLongError as e:
+                log.warning("ChatGPT rejected an oversized prompt: %s", e)
+                raise HTTPException(status_code=413, detail=str(e)) from e
+            except PromptAttachmentFallbackError as e:
+                log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+                raise HTTPException(status_code=502, detail=str(e)) from e
             except Exception as e:
                 log.error(f"ChatGPT error: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=f"ChatGPT error: {str(e)}")
@@ -2744,6 +2751,7 @@ async def _run_async_chat_job(job_id: str, request: ChatCompletionRequest, app_k
             if job is not None:
                 job.status = "failed"
                 job.error = str(e)
+                job.error_status_code = int(getattr(e, "status_code", 500))
 
 
 async def _submit_async_chat_job(

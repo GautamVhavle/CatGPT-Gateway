@@ -152,6 +152,7 @@ class ChatCompletionJobResponse(BaseModel):
     model: str = "catgpt-browser"
     response: Optional[ChatCompletionResponse] = None
     error: Optional[str] = None
+    error_status_code: Optional[int] = None
 
 
 # ── Models endpoint ─────────────────────────────────────────────

@@ -195,6 +195,8 @@ environment:
 | `CHATGPT_MODEL_SETTINGS` | Instant/Medium/High/Extra High/Pro mappings | Comma-separated effort map used through Advanced → Effort. |
 | `CHATGPT_MODEL_SWITCH_TIMEOUT` | `10000` | Milliseconds to wait for a model label after switching. |
 | `CHATGPT_MODEL_SWITCH_STRICT` | `false` | Return an error when a configured model is not visible instead of continuing. |
+| `CHATGPT_LONG_PROMPT_FALLBACK` | `attachment` | Handle a ChatGPT composer length rejection by uploading the full prompt as a UTF-8 `.txt` attachment; use `error` to return HTTP 413 instead. |
+| `CHATGPT_LONG_PROMPT_THRESHOLD` | `0` | Optional proactive character threshold. `0` uses ChatGPT's live UI validation instead of a hard-coded limit. |
 
 ### API
 

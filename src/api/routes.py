@@ -25,6 +25,7 @@ from src.api.schemas import (
 )
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.errors import PromptAttachmentFallbackError, PromptTooLongError
 from src.chatgpt.model_registry import is_supported_chat_model, list_public_chat_models
 from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
@@ -131,6 +132,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 read_aloud=req.read_aloud,
             )
             return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except Exception as e:
             log.error(f"Chat error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -155,6 +162,12 @@ async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
                 read_aloud=req.read_aloud,
             )
             return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except Exception as e:
             log.error(f"Thread chat error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -176,6 +189,12 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
                 read_aloud=req.read_aloud,
             )
             return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except Exception as e:
             log.error(f"New thread error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))

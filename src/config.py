@@ -75,6 +75,14 @@ class Config:
     )
     CHATGPT_MODEL_SWITCH_TIMEOUT: int = int(os.getenv("CHATGPT_MODEL_SWITCH_TIMEOUT", "10000"))
     CHATGPT_MODEL_SWITCH_STRICT: bool = os.getenv("CHATGPT_MODEL_SWITCH_STRICT", "false").lower() == "true"
+    # Browser UI-driven long-prompt fallback.  The threshold is optional because
+    # ChatGPT's effective composer limit can vary by model/account.
+    CHATGPT_LONG_PROMPT_FALLBACK: str = os.getenv(
+        "CHATGPT_LONG_PROMPT_FALLBACK", "attachment"
+    ).strip().lower()
+    CHATGPT_LONG_PROMPT_THRESHOLD: int = max(
+        0, int(os.getenv("CHATGPT_LONG_PROMPT_THRESHOLD", "0"))
+    )
     ATTACHMENT_EXPAND_MULTIPAGE: bool = os.getenv("ATTACHMENT_EXPAND_MULTIPAGE", "true").lower() == "true"
     ATTACHMENT_MAX_PAGES: int = int(os.getenv("ATTACHMENT_MAX_PAGES", "24"))
     ATTACHMENT_RENDER_DPI: int = int(os.getenv("ATTACHMENT_RENDER_DPI", "144"))
