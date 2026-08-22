@@ -10,6 +10,7 @@ This guide covers every way to run CatGPT Gateway: Docker, local development, an
 - [Docker Setup (recommended)](#docker-setup-recommended)
 - [Local Setup (no Docker)](#local-setup-no-docker)
 - [Nix Flake Setup](#nix-flake-setup)
+- [Environment Variables](ENVIRONMENT.md)
 - [First Login](#first-login)
 - [Switching Providers](#switching-providers)
 - [Authentication](#authentication)
@@ -33,11 +34,11 @@ Docker runs the entire stack in one container: virtual display, VNC, browser, an
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
-cd CatGPT-Gateway
+git clone https://github.com/TheBadFella/CatGPT.git
+cd CatGPT
 
-# 2. Copy the environment template
-cp .env.example .env
+# 2. Create .env and set your own API and browser-GUI passwords
+#    See docs/ENVIRONMENT.md for every supported value.
 
 # 3. Edit .env to pick your provider
 #    Set PROVIDER=claude or PROVIDER=chatgpt
@@ -64,6 +65,15 @@ curl -X POST http://localhost:8650/v1/chat/completions \
   }'
 ```
 
+Minimal `.env`:
+
+```dotenv
+CATGPT_API_KEY=replace-me
+CATGPT_VNC_PASSWORD=replace-me
+CATGPT_USER_ID=1000
+CATGPT_GROUP_ID=1000
+```
+
 ### Docker Notes
 
 - **Code is baked into the image.** After editing source files, rebuild:
@@ -84,8 +94,8 @@ curl -X POST http://localhost:8650/v1/chat/completions \
 
 ```bash
 # 1. Clone and enter the repo
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
-cd CatGPT-Gateway
+git clone https://github.com/TheBadFella/CatGPT.git
+cd CatGPT
 
 # 2. Create a virtual environment
 python3 -m venv .venv
@@ -97,9 +107,8 @@ pip install -r requirements.txt
 # 4. Install Chromium for Patchright
 patchright install chromium
 
-# 5. Copy and configure environment
-cp .env.example .env
-# Edit .env -> set PROVIDER=claude or PROVIDER=chatgpt
+# 5. Optionally create .env to override defaults
+# See docs/ENVIRONMENT.md; for example, set PROVIDER=claude
 
 # 6. First login (one-time)
 python scripts/first_login.py
@@ -120,8 +129,8 @@ python -m src.cli.app
 This repo ships a `flake.nix` that packages Patchright and matching Chromium revisions.
 
 ```bash
-# 1. Copy env template
-cp .env.example .env
+# 1. Optionally create .env to override defaults
+# See docs/ENVIRONMENT.md
 
 # 2. First login (one-time, interactive)
 nix run .#login

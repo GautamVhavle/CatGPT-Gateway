@@ -18,8 +18,9 @@ Thanks for your interest in contributing! This project is open source and we wel
    source .venv/bin/activate
    pip install -r requirements.txt
    patchright install chromium
-   cp .env.example .env
    ```
+   Create a root `.env` only if you need to override a default; see the
+   [generated environment reference](docs/ENVIRONMENT.md).
 4. **Create a branch** for your changes:
    ```bash
    git checkout -b feature/your-feature-name
@@ -85,7 +86,7 @@ If you find a bug, please open an issue first describing the problem. If you hav
 
 ### Documentation
 
-Docs live in `docs/` and the root `README.md`. Improvements, corrections, and additional examples are always welcome.
+Docs live in `docs/` and the root `README.md`. Improvements, corrections, and additional examples are always welcome. After changing an environment variable, regenerate the reference with `python scripts/generate_env_reference.py`.
 
 ---
 

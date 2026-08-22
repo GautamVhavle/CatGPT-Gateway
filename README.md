@@ -20,6 +20,7 @@
   <a href="#why-this-fork">Features</a> ·
   <a href="#fork-vs-upstream">Fork vs Upstream</a> ·
   <a href="docs/API.md">API</a> ·
+  <a href="docs/ENVIRONMENT.md">Environment</a> ·
   <a href="docs/SETUP.md">Setup</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a>
 </p>
@@ -96,10 +97,18 @@ This table focuses only on meaningful differences:
 ```bash
 git clone https://github.com/TheBadFella/CatGPT.git
 cd CatGPT
-cp .env.example .env
 ```
 
-At minimum, change `CATGPT_API_KEY` and `CATGPT_VNC_PASSWORD` in `.env`. See [.env.example](.env.example) for common local and Compose settings.
+Create `.env` with your own credentials (the checked-in defaults are intentionally only suitable for local testing):
+
+```dotenv
+CATGPT_API_KEY=replace-me
+CATGPT_VNC_PASSWORD=replace-me
+CATGPT_USER_ID=1000
+CATGPT_GROUP_ID=1000
+```
+
+See the [generated environment reference](docs/ENVIRONMENT.md) for every setting and its default.
 
 ### 2. Start the container
 
@@ -151,13 +160,14 @@ Use `/{app_name}/v1/...` or `/{app_name}/api/...` routes to isolate applications
 | `CHATGPT_DEFAULT_MODEL` | Current UI selection | Default ChatGPT model mapping |
 | `CHATGPT_LONG_PROMPT_FALLBACK` | `attachment` | Upload oversized prompts or use `error` for HTTP 413 |
 
-See [.env.example](.env.example), [docker-compose.yml](docker-compose.yml), and the [Setup Guide](docs/SETUP.md) for advanced options. Add runtime-only Docker overrides under `services.catgpt.environment`.
+See the [generated environment reference](docs/ENVIRONMENT.md), [docker-compose.yml](docker-compose.yml), and the [Setup Guide](docs/SETUP.md) for advanced options. Add runtime-only Docker overrides under `services.catgpt.environment`.
 
 ## Documentation
 
 | Guide | What it covers |
 |---|---|
 | [API Reference](docs/API.md) | Request formats, tools, vision, files, images, audio, and native routes |
+| [Environment Reference](docs/ENVIRONMENT.md) | Every runtime and Docker Compose variable, default, and purpose |
 | [Setup Guide](docs/SETUP.md) | Docker, local installation, login, persistence, and troubleshooting |
 | [Model Switching](docs/MODEL_SWITCHING.md) | ChatGPT model aliases, versions, and effort settings |
 | [Architecture](docs/ARCHITECTURE.md) | Browser lifecycle, routing, extraction, and response detection |
