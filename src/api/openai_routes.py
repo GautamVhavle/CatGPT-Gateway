@@ -16,10 +16,13 @@ import json
 import re
 import time
 import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from patchright.async_api import Page
 
 from src.api.openai_schemas import (
     ChatCompletionRequest,
@@ -54,81 +57,353 @@ log = setup_logging("openai_routes")
 
 openai_router = APIRouter()
 
-# Global reference — set by server.py at startup
+# Global references — set by server.py at startup
 _client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
-
-# Serialize all requests — single browser page, not thread-safe.
-# Created lazily to avoid Python 3.9 event-loop binding issues.
-_lock: asyncio.Lock | None = None
+_browser: Any = None
 
 
-def _get_lock() -> asyncio.Lock:
-    """Get or create the global request lock (lazy init)."""
-    global _lock
-    if _lock is None:
-        _lock = asyncio.Lock()
-    return _lock
-
-
-# Track messages in the current thread to prevent thread exhaustion
-_thread_message_count = 0
-_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
-_last_response_time: float = 0.0
-_MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
-
-
-async def _ensure_fresh_chat() -> None:
-    """Enforce cooldown between messages and start new chat if thread is full.
-
-    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
-    generating, copy-button never appears). We preemptively start a
-    new chat after _MAX_THREAD_MESSAGES to prevent this.
-
-    Also enforces a minimum gap between consecutive messages, since
-    ChatGPT's UI may not accept rapid-fire messages properly.
+class BrowserPagePool:
     """
-    global _thread_message_count, _last_response_time
+    Manages a pool of clean, stateless browser pages (tabs) for concurrent requests.
+    Each request executes in its own isolated page/tab, preventing crosstalk and prompt bloat.
+    """
 
-    # API-backed providers do not need browser cooldowns or thread rotation.
-    # Their OpenAI-compatible calls are made statelessly below because each
-    # request already carries its complete conversation history.
-    if not Config.uses_browser():
-        _thread_message_count = 0
-        return
+    def __init__(self, browser: Any = None, max_concurrency: int = 3):
+        self._browser = browser
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._pool: asyncio.Queue[Page] = asyncio.Queue()
+        self._max_concurrency = max_concurrency
 
-    # Enforce minimum gap between messages
-    if _last_response_time > 0:
-        elapsed = time.time() - _last_response_time
-        if elapsed < _MIN_MESSAGE_GAP:
-            wait = _MIN_MESSAGE_GAP - elapsed
-            log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
-            await asyncio.sleep(wait)
+    def set_browser(self, browser: Any) -> None:
+        self._browser = browser
 
-    if _thread_message_count < _MAX_THREAD_MESSAGES:
-        return  # Thread is fresh enough — no navigation needed
+    @asynccontextmanager
+    async def acquire_clean_page(self):
+        """Acquire a fresh, stateless Page ready at ChatGPT / Claude."""
+        if not Config.uses_browser():
+            yield None
+            return
 
-    client = _get_client()
-    try:
-        await client.new_chat()
-        _thread_message_count = 0
-    except Exception as e:
-        log.warning(f"new_chat() failed, retrying once: {e}")
+        await self._semaphore.acquire()
+        page: Page | None = None
+        keep_page = True
         try:
-            await asyncio.sleep(2)
-            await client.new_chat()
-            _thread_message_count = 0
-        except Exception as e2:
-            log.error(f"new_chat() retry also failed: {e2}")
-            # Don't raise — continue with current thread rather than failing
-            log.warning("Continuing with current thread despite new_chat failure")
+            # 1. Borrow from pool or create new page
+            try:
+                page = self._pool.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                elif self._browser and getattr(self._browser, "page", None):
+                    page = self._browser.page
+                else:
+                    raise RuntimeError("Browser is not running")
+
+            if page is None or page.is_closed():
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                else:
+                    raise RuntimeError("Browser context unavailable")
+
+            # 2. Ensure page is at the provider URL and in a fresh chat state
+            target_url = Config.provider_url()
+            current_url = page.url or ""
+
+            if target_url not in current_url and not current_url.startswith(target_url):
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+            else:
+                try:
+                    new_chat_btn = await page.query_selector(
+                        "a[data-testid='create-new-chat-button'], a[href='/']"
+                    )
+                    if new_chat_btn:
+                        await new_chat_btn.click()
+                        await asyncio.sleep(0.3)
+                    elif current_url != f"{target_url}/" and current_url != target_url:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+                except Exception as e:
+                    log.debug(f"Reset to fresh chat exception: {e}")
+
+            yield page
+
+        except Exception as e:
+            keep_page = False
+            if page and not page.is_closed():
+                main_p = getattr(self._browser, "page", None)
+                if page != main_p:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            raise e
+        finally:
+            if keep_page and page and not page.is_closed():
+                try:
+                    await self._pool.put(page)
+                except Exception:
+                    main_p = getattr(self._browser, "page", None)
+                    if page != main_p:
+                        await page.close()
+            elif page and not page.is_closed():
+                main_p = getattr(self._browser, "page", None)
+                if page != main_p:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            self._semaphore.release()
 
 
-def _increment_thread_count() -> None:
-    """Increment the thread message counter after a successful response."""
-    global _thread_message_count, _last_response_time
-    _thread_message_count += 1
-    _last_response_time = time.time()
-    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
+_page_pool: BrowserPagePool | None = None
+
+
+class PersistentSessionManager:
+    """
+    Manages persistent browser pages for sessions.
+
+    Key features:
+    - Session → ChatGPT conversation URL mapping: each session_id remembers
+      which /c/<thread_id> URL it belongs to so it can resume without starting
+      a new chat on every restart.
+    - LRU tab cap: at most MAX_ACTIVE_TABS tabs are open at once.  When the
+      limit is reached the least-recently-used *idle* tab is closed to free
+      memory.  Its URL is preserved so it can be reopened transparently on the
+      next request.
+    """
+
+    def __init__(self, browser: Any = None):
+        self._browser = browser
+
+        # session_id → open Page object (only sessions with an open tab)
+        self._pages: dict[str, Page] = {}
+        # session_id → asyncio.Lock (one lock per session for serialisation)
+        self._locks: dict[str, asyncio.Lock] = {}
+        # session_id → ChatGPT conversation URL (persists even when tab closed)
+        self._session_urls: dict[str, str] = {}
+        # LRU order: session_id → last-used timestamp; OrderedDict keeps insertion order
+        self._lru: OrderedDict[str, float] = OrderedDict()
+        # Sessions whose first message has been sent (used for prompt pruning)
+        self._session_initialized: set[str] = set()
+        # Lock protecting _lru / _pages structural modifications
+        self._evict_lock = asyncio.Lock()
+
+    def set_browser(self, browser: Any) -> None:
+        self._browser = browser
+
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._locks:
+            self._locks[session_id] = asyncio.Lock()
+        return self._locks[session_id]
+
+    # ── LRU helpers ──────────────────────────────────────────────────────────
+
+    def _touch(self, session_id: str) -> None:
+        """Mark session as most-recently used."""
+        self._lru[session_id] = time.monotonic()
+        self._lru.move_to_end(session_id)  # most-recent at the end
+
+    def _active_tab_count(self) -> int:
+        return sum(
+            1 for p in self._pages.values()
+            if p is not None and not p.is_closed()
+        )
+
+    async def _evict_lru_idle(self) -> None:
+        """
+        Close the least-recently-used tab that is not currently locked.
+        Its URL mapping is kept so the session can be transparently restored
+        on the next request.
+        """
+        async with self._evict_lock:
+            for sid in list(self._lru.keys()):  # oldest first
+                lock = self._locks.get(sid)
+                if lock and lock.locked():
+                    continue  # skip sessions currently in use
+                page = self._pages.get(sid)
+                if page and not page.is_closed():
+                    try:
+                        # Save URL before closing
+                        url = page.url or ""
+                        if "/c/" in url:
+                            self._session_urls[sid] = url
+                        await page.close()
+                        log.info(
+                            f"[LRU] Evicted tab for session '{sid}' "
+                            f"(url={self._session_urls.get(sid, 'none')})"
+                        )
+                    except Exception as e:
+                        log.debug(f"[LRU] Error closing evicted tab: {e}")
+                    finally:
+                        self._pages.pop(sid, None)
+                    return  # evicted one tab — done
+
+    # ── URL tracking ─────────────────────────────────────────────────────────
+
+    async def _save_conversation_url(self, session_id: str, page: Page) -> None:
+        """Extract and persist the ChatGPT conversation URL from page after send."""
+        try:
+            url = page.url or ""
+            if "/c/" in url:
+                self._session_urls[session_id] = url
+                log.debug(f"[Session] Saved URL for '{session_id}': {url}")
+        except Exception:
+            pass
+
+    # ── Public info ──────────────────────────────────────────────────────────
+
+    def session_info(self) -> list[dict]:
+        """Return a list of dicts with info about all known sessions."""
+        rows = []
+        for sid, ts in self._lru.items():
+            page = self._pages.get(sid)
+            is_open = page is not None and not page.is_closed()
+            age_s = int(time.monotonic() - ts)
+            rows.append({
+                "session_id": sid,
+                "tab_open": is_open,
+                "conversation_url": self._session_urls.get(sid),
+                "last_used_seconds_ago": age_s,
+            })
+        # Most-recently-used last → reverse for display (newest first)
+        rows.reverse()
+        return rows
+
+    # ── Main context manager ──────────────────────────────────────────────────
+
+    @asynccontextmanager
+    async def acquire_session_page(self, session_id: str):
+        """Acquire the persistent Page bound to session_id.
+
+        - Opens a new tab if the session has no open tab.
+        - If the tab limit is reached, evicts the LRU idle tab first.
+        - Navigates to the session's known conversation URL if one exists,
+          otherwise starts a fresh chat.
+        - After the caller is done, captures the updated conversation URL.
+        """
+        lock = self._get_lock(session_id)
+        await lock.acquire()
+        page: Page | None = None
+        try:
+            self._touch(session_id)
+            page = self._pages.get(session_id)
+            is_first_turn = session_id not in self._session_initialized
+
+            if page is None or page.is_closed():
+                # ── Evict LRU tab if at the limit ────────────────────────────
+                if self._active_tab_count() >= Config.MAX_ACTIVE_TABS:
+                    log.info(
+                        f"[LRU] Tab limit ({Config.MAX_ACTIVE_TABS}) reached — "
+                        "evicting least-recently-used idle tab"
+                    )
+                    await self._evict_lru_idle()
+
+                # ── Open a new tab ────────────────────────────────────────────
+                if self._browser and getattr(self._browser, "context", None):
+                    page = await self._browser.new_page()
+                elif self._browser and getattr(self._browser, "page", None):
+                    page = self._browser.page
+                else:
+                    raise RuntimeError("Browser is not running")
+
+                # ── Navigate to known URL or start fresh ──────────────────────
+                known_url = self._session_urls.get(session_id)
+                if known_url:
+                    log.info(
+                        f"[Session] Restoring '{session_id}' → {known_url}"
+                    )
+                    try:
+                        await page.goto(
+                            known_url, wait_until="domcontentloaded", timeout=25000
+                        )
+                        is_first_turn = False  # resuming existing conversation
+                    except Exception as e:
+                        log.warning(
+                            f"[Session] Failed to restore URL for '{session_id}': {e}. "
+                            "Starting fresh chat."
+                        )
+                        known_url = None
+
+                if not known_url:
+                    target_url = Config.provider_url()
+                    await page.goto(
+                        target_url, wait_until="domcontentloaded", timeout=25000
+                    )
+                    is_first_turn = True
+
+                self._pages[session_id] = page
+                self._session_initialized.add(session_id)
+
+            yield page, is_first_turn
+
+            # ── After send: capture updated conversation URL ───────────────
+            await self._save_conversation_url(session_id, page)
+
+        finally:
+            lock.release()
+
+
+_session_manager: PersistentSessionManager | None = None
+
+
+def _get_session_manager() -> PersistentSessionManager:
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = PersistentSessionManager(_browser)
+    return _session_manager
+
+
+def _extract_session_id(raw_request: Request | None, body_user: str | None = None) -> str | None:
+    """Extract session ID from request headers or body user field."""
+    if raw_request is not None:
+        for header_key in ("x-session-id", "session-id", "x-thread-id", "thread-id"):
+            val = raw_request.headers.get(header_key)
+            if val and val.strip():
+                return val.strip()
+    if body_user and body_user.strip():
+        return body_user.strip()
+    return None
+
+
+def _extract_persistent_prompt(
+    messages: list[ChatMessage],
+    is_first_turn: bool,
+    has_tool_prompt: bool = False,
+) -> tuple[str, list[ChatMessage]]:
+    """
+    In persistent mode, the webpage itself remembers history.
+    If the client sent repeated full history, prune it down to the latest user message
+    (plus system prompt if first turn) to prevent prompt duplication bloat.
+    """
+    if not messages:
+        return "", []
+
+    if is_first_turn:
+        return _build_prompt(messages), messages
+
+    # Subsequent turns: Extract latest user turn (and any tool results directly associated with it)
+    latest_msgs: list[ChatMessage] = []
+    for msg in reversed(messages):
+        if msg.role in ("user", "tool"):
+            latest_msgs.insert(0, msg)
+            if msg.role == "user":
+                break
+
+    if not latest_msgs:
+        latest_msgs = [messages[-1]]
+
+    pruned_prompt = _build_prompt(latest_msgs)
+    log.info(
+        f"[Persistent Session] Pruned history: original {len(messages)} messages "
+        f"-> {len(latest_msgs)} latest message(s) ({len(pruned_prompt)} chars)"
+    )
+    return pruned_prompt, latest_msgs
+
+
+def _get_page_pool() -> BrowserPagePool:
+    global _page_pool
+    if _page_pool is None:
+        _page_pool = BrowserPagePool(_browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
+    return _page_pool
 
 
 def _resolve_model_id(requested: str | None) -> str:
@@ -141,10 +416,14 @@ def _resolve_model_id(requested: str | None) -> str:
 
 def set_openai_client(
     client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+    browser: Any = None,
 ) -> None:
-    """Called by server.py to inject the client."""
-    global _client
+    """Called by server.py to inject the client and browser."""
+    global _client, _browser, _page_pool, _session_manager
     _client = client
+    _browser = browser
+    _page_pool = BrowserPagePool(browser, max_concurrency=Config.MAX_CONCURRENT_REQUESTS)
+    _session_manager = PersistentSessionManager(browser)
 
 
 def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
@@ -663,7 +942,7 @@ async def create_image(
 
     client = _get_client()
 
-    async with _get_lock():
+    async with _get_page_pool().acquire_clean_page() as page:
         start_time = time.time()
 
         # Build an image-generation prompt.
@@ -756,27 +1035,128 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
-        _increment_thread_count()
         return ImagesResponse(data=image_data_list)
 
 
-@openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def _stream_chat_completion_chunks(
+    response_text: str | None,
+    tool_calls: list[ToolCall] | None,
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+):
+    """
+    Yield standard OpenAI SSE chunks for streaming /v1/chat/completions.
+    """
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created_time = int(time.time())
+
+    # 1) Initial chunk with role
+    first_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(first_chunk)}\n\n"
+
+    # 2) Text delta chunks
+    if response_text:
+        chunk_size = 20
+        for i in range(0, len(response_text), chunk_size):
+            chunk_content = response_text[i : i + chunk_size]
+            chunk_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+            await asyncio.sleep(0.005)
+
+    # 3) Tool call chunks
+    if tool_calls:
+        for idx, tc in enumerate(tool_calls):
+            tc_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": idx,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(tc_data)}\n\n"
+
+    # 4) Final chunk
+    final_finish_reason = "tool_calls" if tool_calls else "stop"
+    final_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": final_finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+
+    # 5) [DONE]
+    yield "data: [DONE]\n\n"
+
+
+@openai_router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
-) -> ChatCompletionResponse:
+    raw_request: Request,
+):
     """
     OpenAI-compatible chat completions endpoint.
 
     Converts the message array into a single prompt, sends it to ChatGPT
     via browser automation, and returns an OpenAI-formatted response.
-    Supports tool/function calling via prompt injection.
+    Supports streaming, tool/function calling, stateless execution, and persistent sessions.
     """
     # ── Validate ────────────────────────────────────────────
-    if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported. Set stream=false or omit it.",
-        )
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
@@ -791,42 +1171,57 @@ async def create_chat_completion(
 
     client = _get_client()
     model_id = _resolve_model_id(request.model)
+    session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    async with _get_lock():
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
         messages = list(request.messages)
 
-        # If tools are provided, inject tool definitions as a system prompt
-        # (unless tool_choice="none", which means ignore tools)
         has_tool_prompt = False
         if request.tools and request.tool_choice != "none":
             tool_system = _build_tool_system_prompt(
                 request.tools, tool_choice=request.tool_choice
             )
-            # Prepend as the first system message
             messages.insert(0, ChatMessage(role="system", content=tool_system))
             has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        if is_persistent:
+            prompt, active_messages = _extract_persistent_prompt(
+                messages, is_first_turn, has_tool_prompt
+            )
+        else:
+            prompt = _build_prompt(messages)
+            active_messages = messages
+
         log.info(
             f"POST /v1/chat/completions — model={model_id}, "
-            f"{len(request.messages)} messages, prompt={len(prompt)} chars"
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
+            f"prompt={len(prompt)} chars"
         )
 
-        # ── Extract attachments from messages ──────────────
+        # ── Extract attachments from active messages ────────
         image_paths: list[str] = []
         file_paths: list[str] = []
-        for msg in request.messages:
+        for msg in active_messages:
             if msg.role == "user" and isinstance(msg.content, list):
-                # Images (OpenAI vision format)
                 image_urls = _extract_image_urls(msg.content)
                 for url in image_urls:
                     local_path = await _download_file(url)
                     if local_path:
                         image_paths.append(local_path)
-                # Generic file attachments
                 file_attachments = _extract_file_attachments(msg.content)
                 for fa in file_attachments:
                     local_path = await _download_file(fa)
@@ -837,9 +1232,6 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
-
         # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
@@ -847,11 +1239,63 @@ async def create_chat_completion(
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
                 model=model_id,
-                stateless=not Config.uses_browser(),
+                stateless=not is_persistent,
+                page=page,
+            )
+        except asyncio.TimeoutError as e:
+            elapsed_s = int(time.time() - start_time)
+            log.error(f"ChatGPT response timed out after {elapsed_s}s: {e}")
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "error_type": "response_timeout",
+                    "message": (
+                        f"ChatGPT did not finish responding within {elapsed_s}s. "
+                        "Deep-thinking / reasoning models may need up to 20 minutes. "
+                        "Increase RESPONSE_TIMEOUT env var or retry."
+                    ),
+                    "elapsed_seconds": elapsed_s,
+                    "tip": "Set RESPONSE_TIMEOUT=1200000 (20 min) for o1/o3 reasoning models.",
+                },
+            )
+        except RuntimeError as e:
+            elapsed_s = int(time.time() - start_time)
+            err_str = str(e)
+            log.error(f"Provider runtime error after {elapsed_s}s: {err_str}", exc_info=True)
+            # Classify the error for the caller
+            if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+                status, error_type = 504, "response_timeout"
+                tip = "ChatGPT may still be thinking. Retry or increase RESPONSE_TIMEOUT."
+            elif "page is in error state" in err_str.lower() or "something went wrong" in err_str.lower():
+                status, error_type = 502, "chatgpt_page_error"
+                tip = "ChatGPT displayed an error page. Check http://127.0.0.1:8000/preview and retry."
+            elif "chat input" in err_str.lower() or "send button" in err_str.lower():
+                status, error_type = 503, "chatgpt_ui_unavailable"
+                tip = "ChatGPT UI elements not found. The page may need a reload — check /preview."
+            else:
+                status, error_type = 500, "provider_error"
+                tip = "Unexpected gateway error. Check server logs."
+            raise HTTPException(
+                status_code=status,
+                detail={
+                    "error_type": error_type,
+                    "message": err_str,
+                    "elapsed_seconds": elapsed_s,
+                    "tip": tip,
+                },
             )
         except Exception as e:
-            log.error(f"Provider error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
+            elapsed_s = int(time.time() - start_time)
+            log.error(f"Unexpected provider error after {elapsed_s}s: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_type": "unexpected_error",
+                    "message": str(e),
+                    "elapsed_seconds": elapsed_s,
+                    "tip": "Check server logs for full traceback.",
+                },
+            )
 
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
@@ -926,7 +1370,18 @@ async def create_chat_completion(
             f"tokens≈{response.usage.total_tokens}"
         )
 
-        _increment_thread_count()
+        if request.stream:
+            return StreamingResponse(
+                _stream_chat_completion_chunks(
+                    response_text,
+                    tool_calls,
+                    model_id,
+                    prompt_tokens,
+                    completion_tokens,
+                ),
+                media_type="text/event-stream",
+            )
+
         return response
 
 
@@ -1262,7 +1717,10 @@ async def _stream_response_events(
 
 
 @openai_router.post("/v1/responses")
-async def create_response(request: ResponsesRequest):
+async def create_response(
+    request: ResponsesRequest,
+    raw_request: Request,
+):
     """
     OpenAI Responses API endpoint — compatible with Codex CLI.
 
@@ -1282,8 +1740,20 @@ async def create_response(request: ResponsesRequest):
 
     client = _get_client()
     model_id = _resolve_model_id(request.model)
+    session_id = _extract_session_id(raw_request, getattr(request, "user", None))
 
-    async with _get_lock():
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
         start_time = time.time()
 
         # ── Convert input to ChatMessage list ───────────────
@@ -1309,22 +1779,26 @@ async def create_response(request: ResponsesRequest):
                 )
                 has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        if is_persistent:
+            prompt, _ = _extract_persistent_prompt(
+                messages, is_first_turn, has_tool_prompt
+            )
+        else:
+            prompt = _build_prompt(messages)
+
         log.info(
             f"POST /v1/responses — model={model_id}, "
-            f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
-
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
 
         # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
                 model=model_id,
-                stateless=not Config.uses_browser(),
+                stateless=not is_persistent,
+                page=page,
             )
         except RuntimeError as e:
             err_msg = str(e).lower()
@@ -1468,3 +1942,702 @@ async def create_response(request: ResponsesRequest):
             )
 
         return resp.model_dump()
+
+
+@openai_router.post("/v1/messages")
+async def create_anthropic_message(request: Request):
+    """
+    Anthropic Messages API compatibility endpoint.
+    Allows Claude Code CLI and other Anthropic SDK clients to use CatGPT Gateway.
+    """
+    body = await request.json()
+    model = body.get("model", "claude-browser")
+    messages = body.get("messages", [])
+    system = body.get("system", "")
+    stream = body.get("stream", False)
+
+    chat_messages: list[ChatMessage] = []
+    if system:
+        if isinstance(system, list):
+            sys_text = "\n".join(
+                s.get("text", "") if isinstance(s, dict) else str(s)
+                for s in system
+            )
+        else:
+            sys_text = str(system)
+        chat_messages.append(ChatMessage(role="system", content=sys_text))
+
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content_str = "\n".join(text_parts)
+        else:
+            content_str = str(content)
+        chat_messages.append(ChatMessage(role=role, content=content_str))
+
+    client = _get_client()
+    model_id = _resolve_model_id(model)
+    session_id = _extract_session_id(request, body.get("user") or body.get("session_id"))
+
+    if session_id:
+        page_cm = _get_session_manager().acquire_session_page(session_id)
+        is_persistent = True
+    else:
+        @asynccontextmanager
+        async def _stateless_cm():
+            async with _get_page_pool().acquire_clean_page() as p:
+                yield p, False
+        page_cm = _stateless_cm()
+        is_persistent = False
+
+    async with page_cm as (page, is_first_turn):
+        start_time = time.time()
+        if is_persistent:
+            prompt, _ = _extract_persistent_prompt(chat_messages, is_first_turn)
+        else:
+            prompt = _build_prompt(chat_messages)
+
+        log.info(
+            f"POST /v1/messages — model={model_id}, "
+            f"{'persistent session=' + session_id if is_persistent else 'stateless'}, "
+            f"prompt={len(prompt)} chars"
+        )
+
+        chat_resp = await client.send_message(
+            prompt, stateless=not is_persistent, page=page
+        )
+        response_text = chat_resp.message
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        prompt_tokens = _estimate_tokens(prompt)
+        completion_tokens = _estimate_tokens(response_text)
+        _increment_thread_count()
+
+        log.info(
+            f"Anthropic Response: {elapsed_ms}ms, "
+            f"tokens≈{prompt_tokens + completion_tokens}"
+        )
+
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        if stream:
+            async def _stream_anthropic_events():
+                # 1. message_start
+                yield (
+                    "event: message_start\n"
+                    f"data: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model_id, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': prompt_tokens, 'output_tokens': 1}}})}\n\n"
+                )
+                # 2. content_block_start
+                yield (
+                    "event: content_block_start\n"
+                    f"data: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                )
+                # 3. content_block_delta chunks
+                chunk_size = 40
+                for i in range(0, len(response_text), chunk_size):
+                    chunk = response_text[i : i + chunk_size]
+                    yield (
+                        "event: content_block_delta\n"
+                        f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk}})}\n\n"
+                    )
+                    await asyncio.sleep(0.01)
+                # 4. content_block_stop
+                yield (
+                    "event: content_block_stop\n"
+                    f"data: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                )
+                # 5. message_delta
+                yield (
+                    "event: message_delta\n"
+                    f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': completion_tokens}})}\n\n"
+                )
+                # 6. message_stop
+                yield (
+                    "event: message_stop\n"
+                    f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+                )
+
+            return StreamingResponse(
+                _stream_anthropic_events(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        return {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model_id,
+            "content": [
+                {
+                    "type": "text",
+                    "text": response_text,
+                }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
+        }
+
+
+@openai_router.get("/v1/tabs")
+async def get_open_tabs():
+    """Return info about all open browser tabs/pages, enriched with session metadata."""
+    if not _browser:
+        return {"tabs": [], "sessions": [], "active_tabs": 0, "max_active_tabs": Config.MAX_ACTIVE_TABS}
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context:
+        return {"tabs": [], "sessions": [], "active_tabs": 0, "max_active_tabs": Config.MAX_ACTIVE_TABS}
+
+    # Build a reverse map: Page → session_id for annotation
+    page_to_session: dict[int, str] = {}
+    if _session_manager:
+        for sid, p in _session_manager._pages.items():
+            if p and not p.is_closed():
+                page_to_session[id(p)] = sid
+
+    tabs = []
+    for idx, p in enumerate(context.pages):
+        if not p.is_closed():
+            url = p.url or ""
+            title = "ChatGPT Tab"
+            try:
+                title = await asyncio.wait_for(p.title(), timeout=0.8)
+            except Exception:
+                pass
+            session_id = page_to_session.get(id(p))
+            tab_info: dict = {
+                "index": idx,
+                "url": url,
+                "title": title or f"Tab #{idx}",
+                "session_id": session_id,
+            }
+            if session_id and _session_manager:
+                last_used = _session_manager._lru.get(session_id)
+                if last_used is not None:
+                    tab_info["last_used_seconds_ago"] = int(time.monotonic() - last_used)
+                conv_url = _session_manager._session_urls.get(session_id)
+                if conv_url:
+                    tab_info["conversation_url"] = conv_url
+            tabs.append(tab_info)
+
+    # All known sessions (including those whose tab is currently closed)
+    sessions = _session_manager.session_info() if _session_manager else []
+
+    return {
+        "tabs": tabs,
+        "active_tabs": len(tabs),
+        "max_active_tabs": Config.MAX_ACTIVE_TABS,
+        "total_known_sessions": len(sessions),
+        "sessions": sessions,
+    }
+
+
+@openai_router.post("/v1/tabs/close")
+async def close_tab(tab: int = 0):
+    """Close a specific browser tab by its index."""
+    if not _browser:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context or not context.pages:
+        raise HTTPException(status_code=503, detail="No active browser pages")
+
+    if tab < 0 or tab >= len(context.pages):
+        raise HTTPException(status_code=404, detail=f"Tab {tab} not found")
+
+    target_page = context.pages[tab]
+    if len(context.pages) <= 1:
+        # Don't close the last remaining tab to preserve browser context; navigate to home
+        try:
+            await target_page.goto(Config.provider_url(), wait_until="domcontentloaded", timeout=10000)
+            return {"status": "reset", "message": "Only 1 tab remained; reset to homepage"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to reset page: {e}")
+
+    # Remove from session manager if associated; preserve URL mapping for later restore
+    if _session_manager:
+        for sid, p in list(_session_manager._pages.items()):
+            if p == target_page:
+                # Save current conversation URL before closing
+                url = target_page.url or ""
+                if "/c/" in url:
+                    _session_manager._session_urls[sid] = url
+                _session_manager._pages.pop(sid, None)
+                log.info(
+                    f"User closed tab for session '{sid}' via monitor "
+                    f"(URL preserved: {_session_manager._session_urls.get(sid, 'none')})"
+                )
+                break
+
+    try:
+        await target_page.close()
+        log.info(f"User closed Tab #{tab} via monitor dashboard")
+        return {"status": "success", "closed_tab": tab}
+    except Exception as e:
+        log.error(f"Failed to close tab {tab}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to close tab: {e}")
+
+
+@openai_router.get("/preview", response_class=HTMLResponse)
+@openai_router.get("/v1/preview", response_class=HTMLResponse)
+async def preview_page():
+    """Live multi-tab browser monitor dashboard with i18n support."""
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CatGPT Gateway &mdash; Live Monitor</title>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card-bg: #151d30;
+            --border: #24324d;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --text-main: #f1f5f9;
+            --text-sub: #94a3b8;
+            --success: #10b981;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 24px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .header {
+            width: 100%;
+            max-width: 1300px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .title-area h1 {
+            font-size: 22px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: linear-gradient(135deg, #60a5fa, #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .title-area p {
+            font-size: 13px;
+            color: var(--text-sub);
+            margin-top: 4px;
+        }
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .btn {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+        .btn-outline {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+        .btn-outline:hover { background: #1f2b45; }
+        .btn-close {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+        .btn-close:hover {
+            background: var(--danger);
+            color: #fff;
+            border-color: var(--danger);
+        }
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-sub);
+            background: var(--card-bg);
+            padding: 6px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 8px var(--success);
+        }
+        .nav-tabs {
+            width: 100%;
+            max-width: 1300px;
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-bottom: 8px;
+            margin-bottom: 16px;
+        }
+        .tab-btn {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            color: var(--text-sub);
+            padding: 8px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s;
+        }
+        .tab-btn:hover { background: #1f2b45; color: var(--text-main); }
+        .tab-btn.active {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+            font-weight: 600;
+        }
+        .grid-container {
+            width: 100%;
+            max-width: 1300px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(580px, 1fr));
+            gap: 20px;
+        }
+        .tab-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        .tab-card:hover { border-color: #3b82f688; }
+        .card-header {
+            padding: 10px 14px;
+            background: #111827;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .card-title {
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 70%;
+        }
+        .tag {
+            font-size: 11px;
+            background: #1e293b;
+            color: #60a5fa;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #2563eb44;
+        }
+        .card-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-body {
+            position: relative;
+            background: #000;
+            line-height: 0;
+        }
+        .tab-img {
+            width: 100%;
+            height: auto;
+            min-height: 300px;
+            display: block;
+            object-fit: cover;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title-area">
+            <h1 id="ui-title">🚀 CatGPT Gateway &mdash; Live Monitor</h1>
+            <p id="ui-subtitle">Real-time monitoring of all background tabs & concurrent sessions (Zero focus interruption)</p>
+        </div>
+        <div class="controls">
+            <button class="btn btn-outline" onclick="toggleLanguage()" id="lang-btn">🌐 Language</button>
+            <div class="status-badge">
+                <div class="status-dot"></div>
+                <span id="tab-count-text">Scanning tabs...</span>
+            </div>
+            <button class="btn" onclick="manualRefresh()" id="ui-refresh-btn">🔄 Refresh</button>
+        </div>
+    </div>
+
+    <div class="nav-tabs" id="tab-bar">
+        <!-- Rendered dynamically -->
+    </div>
+
+    <div class="grid-container" id="grid">
+        <!-- Tab cards rendered dynamically -->
+    </div>
+
+    <script>
+        const i18n = {
+            zh: {
+                title: "🚀 CatGPT Gateway — 实时监控看板",
+                subtitle: "实时监控后台所有并发标签页与会话 (零焦点打扰模式)",
+                scanning: "正在扫描标签页...",
+                activeTabsSuffix: " 个活跃标签页",
+                refreshBtn: "🔄 立即刷新",
+                allTabs: "🔲 全部视图 (Grid)",
+                tabPrefix: "Tab #",
+                mainSuffix: " (主界面)",
+                closeTab: "✕ 关闭标签",
+                closeConfirm: "确定要关闭 Tab #{idx} 吗？",
+                closeFailed: "关闭失败: ",
+                waiting: "⏳ 正在等待浏览器标签页加载...",
+                langBtn: "🌐 English"
+            },
+            en: {
+                title: "🚀 CatGPT Gateway — Live Monitor",
+                subtitle: "Real-time monitoring of background tabs & sessions (Zero focus interruption)",
+                scanning: "Scanning tabs...",
+                activeTabsSuffix: " active tab(s)",
+                refreshBtn: "🔄 Refresh",
+                allTabs: "🔲 All Tabs (Grid)",
+                tabPrefix: "Tab #",
+                mainSuffix: " (Main)",
+                closeTab: "✕ Close Tab",
+                closeConfirm: "Are you sure you want to close Tab #{idx}?",
+                closeFailed: "Failed to close tab: ",
+                waiting: "⏳ Waiting for browser tabs to initialize...",
+                langBtn: "🌐 中文"
+            }
+        };
+
+        const detectedLang = (navigator.language || navigator.userLanguage || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+        let currentLang = localStorage.getItem('catgpt_lang') || detectedLang;
+        let currentMode = 'all';
+        let activeTabs = [];
+
+        function t() {
+            return i18n[currentLang] || i18n.en;
+        }
+
+        function updateStaticTexts() {
+            const dict = t();
+            document.getElementById('ui-title').innerText = dict.title;
+            document.getElementById('ui-subtitle').innerText = dict.subtitle;
+            document.getElementById('ui-refresh-btn').innerText = dict.refreshBtn;
+            document.getElementById('lang-btn').innerText = dict.langBtn;
+        }
+
+        function toggleLanguage() {
+            currentLang = currentLang === 'zh' ? 'en' : 'zh';
+            localStorage.setItem('catgpt_lang', currentLang);
+            updateStaticTexts();
+            renderTabBar();
+            renderGrid();
+        }
+
+        async function fetchTabs() {
+            try {
+                const res = await fetch('/v1/tabs');
+                if (res.ok) {
+                    const data = await res.json();
+                    activeTabs = data.tabs || [];
+                    renderTabBar();
+                    renderGrid();
+                }
+            } catch (err) {
+                console.error("Failed to fetch tabs:", err);
+            }
+        }
+
+        function renderTabBar() {
+            const dict = t();
+            const bar = document.getElementById('tab-bar');
+            document.getElementById('tab-count-text').innerText = `${activeTabs.length} ${dict.activeTabsSuffix}`;
+            
+            let html = `<button class="tab-btn ${currentMode === 'all' ? 'active' : ''}" onclick="selectTabMode('all')">${dict.allTabs} (${activeTabs.length})</button>`;
+            activeTabs.forEach(item => {
+                const isActive = (currentMode === item.index);
+                html += `<button class="tab-btn ${isActive ? 'active' : ''}" onclick="selectTabMode(${item.index})">📑 ${dict.tabPrefix}${item.index}${item.index === 0 ? dict.mainSuffix : ''}</button>`;
+            });
+            bar.innerHTML = html;
+        }
+
+        function renderGrid() {
+            const dict = t();
+            const grid = document.getElementById('grid');
+            if (activeTabs.length === 0) {
+                grid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #64748b;">${dict.waiting}</div>`;
+                return;
+            }
+
+            const tabsToShow = currentMode === 'all' ? activeTabs : activeTabs.filter(item => item.index === currentMode);
+            const ts = new Date().getTime();
+
+            // 1. Remove cards that are no longer in tabsToShow
+            const neededIds = new Set(tabsToShow.map(item => `tab-card-${item.index}`));
+            Array.from(grid.children).forEach(child => {
+                if (child.id && !neededIds.has(child.id)) {
+                    grid.removeChild(child);
+                }
+            });
+
+            // 2. In-place update or create (zero innerHTML wiping = zero flicker!)
+            tabsToShow.forEach(item => {
+                const cardId = `tab-card-${item.index}`;
+                let card = document.getElementById(cardId);
+                const imgSrc = `/v1/screenshot.png?tab=${item.index}&t=${ts}`;
+
+                if (!card) {
+                    card = document.createElement('div');
+                    card.id = cardId;
+                    card.className = 'tab-card';
+                    card.innerHTML = `
+                        <div class="card-header">
+                            <div class="card-title">
+                                <span class="tag">${dict.tabPrefix}${item.index}</span>
+                                <span class="tab-title-text">${item.title || 'ChatGPT'}</span>
+                            </div>
+                            <div class="card-actions">
+                                <button class="btn-close" onclick="closeTab(${item.index}, event)">${dict.closeTab}</button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <img id="img-tab-${item.index}" class="tab-img" src="${imgSrc}" alt="Tab ${item.index}" onclick="selectTabMode(${item.index})" />
+                        </div>
+                    `;
+                    grid.appendChild(card);
+                } else {
+                    // Update texts
+                    const titleEl = card.querySelector('.tab-title-text');
+                    if (titleEl && item.title) titleEl.innerText = item.title;
+                    const closeBtn = card.querySelector('.btn-close');
+                    if (closeBtn) closeBtn.innerText = dict.closeTab;
+                    const tag = card.querySelector('.tag');
+                    if (tag) tag.innerText = `${dict.tabPrefix}${item.index}`;
+
+                    // Double-buffering: Preload in background memory before updating visible img.src
+                    const visibleImg = document.getElementById(`img-tab-${item.index}`);
+                    if (visibleImg) {
+                        const tempImg = new Image();
+                        tempImg.onload = () => {
+                            visibleImg.src = tempImg.src;
+                        };
+                        tempImg.src = imgSrc;
+                    }
+                }
+            });
+        }
+
+        async function closeTab(idx, e) {
+            const dict = t();
+            if (e) e.stopPropagation();
+            if (!confirm(dict.closeConfirm.replace('{idx}', idx))) return;
+            try {
+                const res = await fetch(`/v1/tabs/close?tab=${idx}`, { method: 'POST' });
+                if (res.ok) {
+                    currentMode = 'all';
+                    await fetchTabs();
+                } else {
+                    const err = await res.json();
+                    alert(err.detail || (dict.closeFailed + res.status));
+                }
+            } catch (err) {
+                alert(dict.closeFailed + err);
+            }
+        }
+
+        function selectTabMode(mode) {
+            currentMode = mode;
+            renderTabBar();
+            renderGrid();
+        }
+
+        function manualRefresh() {
+            fetchTabs();
+        }
+
+        // Initialize i18n and data fetching
+        updateStaticTexts();
+        fetchTabs();
+        setInterval(fetchTabs, 2500);
+    </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content)
+
+
+@openai_router.get("/v1/screenshot.png")
+async def get_live_screenshot(tab: int = 0):
+    """Capture and return the screenshot of the requested tab (defaults to 0)."""
+    if not _browser:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    context = getattr(_browser, "_context", None) or getattr(_browser, "context", None)
+    if not context or not context.pages:
+        raise HTTPException(status_code=503, detail="No active browser page")
+
+    if 0 <= tab < len(context.pages) and not context.pages[tab].is_closed():
+        target_page = context.pages[tab]
+    else:
+        target_page = context.pages[0]
+
+    try:
+        screenshot_bytes = await target_page.screenshot(type="png")
+        return Response(content=screenshot_bytes, media_type="image/png")
+    except Exception as e:
+        log.error(f"Failed to capture screenshot of tab {tab}: {e}")
+        raise HTTPException(status_code=500, detail=f"Screenshot failed: {e}")
+

@@ -40,6 +40,9 @@ class Selectors:
         "button[data-testid='stop-button']",
         "button[aria-label='Stop answering']",
         "button[aria-label='Stop generating']",
+        "button[aria-label='Stop streaming']",
+        "button[aria-label*='Stop']",
+        "button[aria-label*='stop']",
     ]
 
     # ── New chat ────────────────────────────────────────────────
@@ -117,9 +120,9 @@ class Selectors:
 
     # ── File / attachment upload input ────────────────────────────
     FILE_UPLOAD_INPUT = [
-        "input#upload-photos",
         "input[type='file']",
         "input[data-testid='file-upload']",
+        "input#upload-photos",
         "input[accept*='image']",
     ]
 
