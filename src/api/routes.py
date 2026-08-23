@@ -26,6 +26,7 @@ from src.api.schemas import (
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
 from src.log import setup_logging
 
 log = setup_logging("api_routes")
@@ -36,11 +37,14 @@ router = APIRouter()
 _lock = asyncio.Lock()
 
 # Global reference — set by the server on startup
-_client: ChatGPTClient | ClaudeClient | None = None
+_client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 _browser: BrowserManager | None = None
 
 
-def set_client(client: ChatGPTClient | ClaudeClient, browser: BrowserManager) -> None:
+def set_client(
+    client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+    browser: BrowserManager | None,
+) -> None:
     """Called by server.py to inject the client instance."""
     global _client, _browser
     _client = client
@@ -157,7 +161,7 @@ async def status() -> StatusResponse:
     """Health check — returns login status and current thread."""
     try:
         client = _get_client()
-        logged_in = await _browser.is_logged_in()
+        logged_in = True if _browser is None else await _browser.is_logged_in()
         tid = client._extract_thread_id()
         return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)
     except Exception:

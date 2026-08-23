@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from src.api.openai_schemas import (
     ChatCompletionRequest,
@@ -27,17 +28,25 @@ from src.api.openai_schemas import (
     Choice,
     ChoiceMessage,
     FunctionCallInfo,
+    FunctionDefinition,
     ImageData,
     ImageGenerationRequest,
     ImagesResponse,
     ModelListResponse,
     ModelObject,
+    ResponseFunctionCall,
+    ResponseObject,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponsesRequest,
+    ResponseUsage,
     ToolCall,
     ToolDefinition,
     UsageInfo,
 )
 from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
+from src.minimax.client import MiniMaxClient
 from src.config import Config
 from src.log import setup_logging
 
@@ -46,26 +55,99 @@ log = setup_logging("openai_routes")
 openai_router = APIRouter()
 
 # Global reference — set by server.py at startup
-_client: ChatGPTClient | ClaudeClient | None = None
+_client: ChatGPTClient | ClaudeClient | MiniMaxClient | None = None
 
-# Serialize all requests — single browser page, not thread-safe
-_lock = asyncio.Lock()
-
-
-def _get_model_id() -> str:
-    """Return model ID based on active provider."""
-    if Config.PROVIDER == "claude":
-        return "claude-browser"
-    return "catgpt-browser"
+# Serialize all requests — single browser page, not thread-safe.
+# Created lazily to avoid Python 3.9 event-loop binding issues.
+_lock: asyncio.Lock | None = None
 
 
-def set_openai_client(client: ChatGPTClient | ClaudeClient) -> None:
+def _get_lock() -> asyncio.Lock:
+    """Get or create the global request lock (lazy init)."""
+    global _lock
+    if _lock is None:
+        _lock = asyncio.Lock()
+    return _lock
+
+
+# Track messages in the current thread to prevent thread exhaustion
+_thread_message_count = 0
+_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
+_last_response_time: float = 0.0
+_MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
+
+
+async def _ensure_fresh_chat() -> None:
+    """Enforce cooldown between messages and start new chat if thread is full.
+
+    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
+    generating, copy-button never appears). We preemptively start a
+    new chat after _MAX_THREAD_MESSAGES to prevent this.
+
+    Also enforces a minimum gap between consecutive messages, since
+    ChatGPT's UI may not accept rapid-fire messages properly.
+    """
+    global _thread_message_count, _last_response_time
+
+    # API-backed providers do not need browser cooldowns or thread rotation.
+    # Their OpenAI-compatible calls are made statelessly below because each
+    # request already carries its complete conversation history.
+    if not Config.uses_browser():
+        _thread_message_count = 0
+        return
+
+    # Enforce minimum gap between messages
+    if _last_response_time > 0:
+        elapsed = time.time() - _last_response_time
+        if elapsed < _MIN_MESSAGE_GAP:
+            wait = _MIN_MESSAGE_GAP - elapsed
+            log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
+            await asyncio.sleep(wait)
+
+    if _thread_message_count < _MAX_THREAD_MESSAGES:
+        return  # Thread is fresh enough — no navigation needed
+
+    client = _get_client()
+    try:
+        await client.new_chat()
+        _thread_message_count = 0
+    except Exception as e:
+        log.warning(f"new_chat() failed, retrying once: {e}")
+        try:
+            await asyncio.sleep(2)
+            await client.new_chat()
+            _thread_message_count = 0
+        except Exception as e2:
+            log.error(f"new_chat() retry also failed: {e2}")
+            # Don't raise — continue with current thread rather than failing
+            log.warning("Continuing with current thread despite new_chat failure")
+
+
+def _increment_thread_count() -> None:
+    """Increment the thread message counter after a successful response."""
+    global _thread_message_count, _last_response_time
+    _thread_message_count += 1
+    _last_response_time = time.time()
+    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
+
+
+def _resolve_model_id(requested: str | None) -> str:
+    """Resolve a request model against the active provider mapping."""
+    try:
+        return Config.resolve_model_id(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def set_openai_client(
+    client: ChatGPTClient | ClaudeClient | MiniMaxClient,
+) -> None:
     """Called by server.py to inject the client."""
     global _client
     _client = client
 
 
-def _get_client() -> ChatGPTClient | ClaudeClient:
+def _get_client() -> ChatGPTClient | ClaudeClient | MiniMaxClient:
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
@@ -150,6 +232,17 @@ def _extract_file_attachments(content) -> list[dict]:
         if data_b64:
             files.append({"filename": filename, "data_b64": data_b64, "mime_type": mime_type})
     return files
+
+
+def _contains_attachment(content) -> bool:
+    """Return whether OpenAI chat/responses content contains an attachment."""
+    if isinstance(content, list):
+        return any(_contains_attachment(item) for item in content)
+    if not isinstance(content, dict):
+        return False
+    if content.get("type") in {"image_url", "file", "input_image", "input_file"}:
+        return True
+    return any(_contains_attachment(value) for value in content.values())
 
 
 async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catgpt_files") -> str | None:
@@ -536,12 +629,12 @@ def _parse_tool_calls(
 
 @openai_router.get("/v1/models", response_model=ModelListResponse)
 async def list_models() -> ModelListResponse:
-    """List available models — returns our single browser-backed model."""
-    model_id = _get_model_id()
-    owned_by = "anthropic" if Config.PROVIDER == "claude" else "catgpt"
+    """List models exposed by the active provider."""
+    owned_by = Config.provider_owner()
     return ModelListResponse(
         data=[
-            ModelObject(id=model_id, owned_by=owned_by),
+            ModelObject(id=model_id, owned_by=owned_by)
+            for model_id in Config.provider_model_ids()
         ]
     )
 
@@ -562,16 +655,15 @@ async def create_image(
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt cannot be empty")
 
-    # Claude does not support image generation
-    if Config.PROVIDER == "claude":
+    if not Config.supports_image_generation():
         raise HTTPException(
             status_code=501,
-            detail="Image generation is not supported by Claude. This feature is only available with the ChatGPT provider.",
+            detail="Image generation is not supported by the active provider.",
         )
 
     client = _get_client()
 
-    async with _lock:
+    async with _get_lock():
         start_time = time.time()
 
         # Build an image-generation prompt.
@@ -593,6 +685,9 @@ async def create_image(
             f"POST /v1/images/generations — prompt='{request.prompt[:80]}', "
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
+
+        # Start a fresh conversation to avoid thread exhaustion
+        await _ensure_fresh_chat()
 
         # Send to ChatGPT
         try:
@@ -661,6 +756,7 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
+        _increment_thread_count()
         return ImagesResponse(data=image_data_list)
 
 
@@ -685,9 +781,18 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
-    client = _get_client()
+    if Config.PROVIDER == "minimax" and any(
+        _contains_attachment(message.content) for message in request.messages
+    ):
+        raise HTTPException(
+            status_code=501,
+            detail="Attachments are not supported by the MiniMax provider.",
+        )
 
-    async with _lock:
+    client = _get_client()
+    model_id = _resolve_model_id(request.model)
+
+    async with _get_lock():
         start_time = time.time()
 
         # ── Build the prompt ────────────────────────────────
@@ -706,7 +811,7 @@ async def create_chat_completion(
 
         prompt = _build_prompt(messages)
         log.info(
-            f"POST /v1/chat/completions — model={request.model}, "
+            f"POST /v1/chat/completions — model={model_id}, "
             f"{len(request.messages)} messages, prompt={len(prompt)} chars"
         )
 
@@ -732,12 +837,17 @@ async def create_chat_completion(
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # ── Send to ChatGPT ────────────────────────────────
+        # Start a fresh conversation to avoid thread exhaustion
+        await _ensure_fresh_chat()
+
+        # ── Send to provider ───────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
+                model=model_id,
+                stateless=not Config.uses_browser(),
             )
         except Exception as e:
             log.error(f"Provider error: {e}", exc_info=True)
@@ -748,10 +858,15 @@ async def create_chat_completion(
 
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
-        if response_text and has_tool_prompt and any(m in response_text for m in _echo_markers):
+        if (
+            Config.uses_browser()
+            and response_text
+            and has_tool_prompt
+            and any(m in response_text for m in _echo_markers)
+        ):
             log.warning("Response appears to echo the sent prompt — retrying extraction")
             try:
-                await asyncio.sleep(3)
+                await asyncio.sleep(1.5)
                 if Config.PROVIDER == "claude":
                     from src.claude.detector import extract_last_response_via_copy
                 else:
@@ -787,7 +902,7 @@ async def create_chat_completion(
         completion_tokens = _estimate_tokens(response_text or "")
 
         response = ChatCompletionResponse(
-            model=request.model,
+            model=model_id,
             choices=[
                 Choice(
                     index=0,
@@ -811,4 +926,545 @@ async def create_chat_completion(
             f"tokens≈{response.usage.total_tokens}"
         )
 
+        _increment_thread_count()
         return response
+
+
+# ── Responses API (/v1/responses) ───────────────────────────────
+
+
+def _responses_input_to_messages(
+    input_data: str | list,
+    instructions: str | None = None,
+) -> list[ChatMessage]:
+    """
+    Convert Responses API `input` (string or item array) into a list of
+    ChatMessage objects compatible with our existing _build_prompt().
+
+    Handles:
+      - Plain string → single user message
+      - Array of message objects (role + content)
+      - function_call items (assistant requested a tool)
+      - function_call_output items (tool results)
+    """
+    messages: list[ChatMessage] = []
+
+    # System prompt from `instructions`
+    if instructions:
+        messages.append(ChatMessage(role="system", content=instructions))
+
+    # Simple string input
+    if isinstance(input_data, str):
+        messages.append(ChatMessage(role="user", content=input_data))
+        return messages
+
+    # Array of items
+    for item in input_data:
+        if isinstance(item, str):
+            messages.append(ChatMessage(role="user", content=item))
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        role = item.get("role")
+
+        if item_type == "function_call":
+            # Assistant called a tool — record as assistant message with tool_calls
+            name = item.get("name", "")
+            arguments = item.get("arguments", "{}")
+            call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:24]}")
+            messages.append(
+                ChatMessage(
+                    role="assistant",
+                    tool_calls=[
+                        ToolCall(
+                            id=call_id,
+                            type="function",
+                            function=FunctionCallInfo(
+                                name=name, arguments=arguments
+                            ),
+                        )
+                    ],
+                )
+            )
+        elif item_type == "function_call_output":
+            # Tool result — map to role=tool
+            call_id = item.get("call_id", "")
+            output = item.get("output", "")
+            messages.append(
+                ChatMessage(
+                    role="tool",
+                    content=output,
+                    tool_call_id=call_id,
+                )
+            )
+        elif item_type == "message" or role:
+            # Regular message item
+            r = role or item.get("role", "user")
+            # Map "developer" role to "system"
+            if r == "developer":
+                r = "system"
+            content = item.get("content", "")
+            # Content can be a list of content parts or a string
+            if isinstance(content, list):
+                # Extract text from content parts
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "input_text":
+                            text_parts.append(part.get("text", ""))
+                        elif part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                content = "\n".join(text_parts) if text_parts else ""
+            messages.append(ChatMessage(role=r, content=content))
+
+    return messages
+
+
+def _responses_tools_to_chat_tools(
+    tools: list[dict],
+) -> list[ToolDefinition]:
+    """
+    Convert flat Responses API tool definitions to nested Chat Completions
+    ToolDefinition format so we can reuse _build_tool_system_prompt().
+
+    Responses:  {"type": "function", "name": "X", "parameters": {...}}
+    Chat:       {"type": "function", "function": {"name": "X", "parameters": {...}}}
+    """
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            tool = tool.model_dump() if hasattr(tool, "model_dump") else dict(tool)
+        if tool.get("type") != "function":
+            continue
+        result.append(
+            ToolDefinition(
+                type="function",
+                function=FunctionDefinition(
+                    name=tool.get("name", ""),
+                    description=tool.get("description", ""),
+                    parameters=tool.get("parameters", {}),
+                ),
+            )
+        )
+    return result
+
+
+def _build_response_object(
+    response_text: str | None,
+    tool_calls: list[ToolCall] | None,
+    request: "ResponsesRequest",
+    prompt_tokens: int,
+    completion_tokens: int,
+    model_id: str,
+) -> ResponseObject:
+    """Build a full ResponseObject from the model output."""
+    now = int(time.time())
+    output: list = []
+    output_text_val: str | None = None
+
+    if tool_calls:
+        for tc in tool_calls:
+            output.append(
+                ResponseFunctionCall(
+                    name=tc.function.name,
+                    arguments=tc.function.arguments,
+                    call_id=tc.id,
+                ).model_dump()
+            )
+    else:
+        text = response_text or ""
+        msg = ResponseOutputMessage(
+            content=[ResponseOutputText(text=text)]
+        )
+        output.append(msg.model_dump())
+        output_text_val = text
+
+    usage = ResponseUsage(
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+
+    # Reconstruct tools for the response envelope
+    tools_echo = []
+    if request.tools:
+        for t in request.tools:
+            tools_echo.append(
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+            )
+
+    return ResponseObject(
+        created_at=now,
+        completed_at=now,
+        status="completed",
+        model=model_id,
+        instructions=request.instructions,
+        max_output_tokens=request.max_output_tokens,
+        output=output,
+        output_text=output_text_val,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        tool_choice=request.tool_choice or "auto",
+        tools=tools_echo,
+        previous_response_id=request.previous_response_id,
+        usage=usage,
+        metadata=request.metadata or {},
+    )
+
+
+async def _stream_response_events(
+    resp: ResponseObject,
+    response_text: str | None,
+    tool_calls: list[ToolCall] | None,
+):
+    """
+    Yield SSE events for a streaming Responses API call.
+
+    Since the browser backend doesn't truly stream, we emit the full
+    response as a burst of events matching the OpenAI SSE contract:
+      response.created → response.in_progress →
+      output_item.added → content_part.added →
+      output_text.delta (full text as one chunk) →
+      output_text.done → content_part.done →
+      output_item.done → response.completed
+    """
+    seq = 0
+    resp_dict = resp.model_dump()
+
+    def _event(event_type: str, data: dict) -> str:
+        data["type"] = event_type
+        data["sequence_number"] = seq
+        return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+    # 1) response.created
+    created_resp = dict(resp_dict)
+    created_resp["status"] = "in_progress"
+    created_resp["completed_at"] = None
+    created_resp["output"] = []
+    created_resp["output_text"] = None
+    created_resp["usage"] = None
+    yield _event("response.created", {"response": created_resp})
+    seq += 1
+
+    # 2) response.in_progress
+    yield _event("response.in_progress", {"response": created_resp})
+    seq += 1
+
+    if tool_calls:
+        # Emit function call output items
+        for idx, tc in enumerate(tool_calls):
+            fc_item = ResponseFunctionCall(
+                name=tc.function.name,
+                arguments=tc.function.arguments,
+                call_id=tc.id,
+            ).model_dump()
+
+            # output_item.added
+            fc_added = dict(fc_item)
+            fc_added["status"] = "in_progress"
+            yield _event("response.output_item.added", {
+                "output_index": idx,
+                "item": fc_added,
+            })
+            seq += 1
+
+            # function_call_arguments.delta (one burst)
+            yield _event("response.function_call_arguments.delta", {
+                "item_id": fc_item["id"],
+                "output_index": idx,
+                "delta": tc.function.arguments,
+            })
+            seq += 1
+
+            # function_call_arguments.done
+            yield _event("response.function_call_arguments.done", {
+                "item_id": fc_item["id"],
+                "output_index": idx,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,
+            })
+            seq += 1
+
+            # output_item.done
+            yield _event("response.output_item.done", {
+                "output_index": idx,
+                "item": fc_item,
+            })
+            seq += 1
+    else:
+        # Emit text message output
+        text = response_text or ""
+        msg = ResponseOutputMessage(
+            content=[ResponseOutputText(text=text)]
+        )
+        msg_dict = msg.model_dump()
+
+        # output_item.added (empty content)
+        msg_added = dict(msg_dict)
+        msg_added["status"] = "in_progress"
+        msg_added["content"] = []
+        yield _event("response.output_item.added", {
+            "output_index": 0,
+            "item": msg_added,
+        })
+        seq += 1
+
+        # content_part.added
+        yield _event("response.content_part.added", {
+            "item_id": msg_dict["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        })
+        seq += 1
+
+        # output_text.delta — full text as one chunk
+        if text:
+            yield _event("response.output_text.delta", {
+                "item_id": msg_dict["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            })
+            seq += 1
+
+        # output_text.done
+        yield _event("response.output_text.done", {
+            "item_id": msg_dict["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        })
+        seq += 1
+
+        # content_part.done
+        yield _event("response.content_part.done", {
+            "item_id": msg_dict["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []},
+        })
+        seq += 1
+
+        # output_item.done
+        yield _event("response.output_item.done", {
+            "output_index": 0,
+            "item": msg_dict,
+        })
+        seq += 1
+
+    # response.completed
+    yield _event("response.completed", {"response": resp_dict})
+
+
+@openai_router.post("/v1/responses")
+async def create_response(request: ResponsesRequest):
+    """
+    OpenAI Responses API endpoint — compatible with Codex CLI.
+
+    Accepts the Responses API format (flat tools, `input` field, `instructions`),
+    translates to our internal format, sends to the browser, and returns a
+    Responses-API-shaped response (or SSE stream).
+    """
+    # ── Validate ────────────────────────────────────────────
+    if not request.input:
+        raise HTTPException(status_code=400, detail="input cannot be empty")
+
+    if Config.PROVIDER == "minimax" and _contains_attachment(request.input):
+        raise HTTPException(
+            status_code=501,
+            detail="Attachments are not supported by the MiniMax provider.",
+        )
+
+    client = _get_client()
+    model_id = _resolve_model_id(request.model)
+
+    async with _get_lock():
+        start_time = time.time()
+
+        # ── Convert input to ChatMessage list ───────────────
+        messages = _responses_input_to_messages(
+            request.input, instructions=request.instructions
+        )
+
+        # ── Convert flat tools to nested format ─────────────
+        chat_tools: list[ToolDefinition] | None = None
+        has_tool_prompt = False
+        if request.tools:
+            raw_tools = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in request.tools
+            ]
+            chat_tools = _responses_tools_to_chat_tools(raw_tools)
+            if chat_tools and request.tool_choice != "none":
+                tool_system = _build_tool_system_prompt(
+                    chat_tools, tool_choice=request.tool_choice
+                )
+                messages.insert(
+                    0, ChatMessage(role="system", content=tool_system)
+                )
+                has_tool_prompt = True
+
+        prompt = _build_prompt(messages)
+        log.info(
+            f"POST /v1/responses — model={model_id}, "
+            f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
+            f"prompt={len(prompt)} chars, stream={request.stream}"
+        )
+
+        # Start a fresh conversation to avoid thread exhaustion
+        await _ensure_fresh_chat()
+
+        # ── Send to provider ───────────────────────────────
+        try:
+            result = await client.send_message(
+                prompt,
+                model=model_id,
+                stateless=not Config.uses_browser(),
+            )
+        except RuntimeError as e:
+            err_msg = str(e).lower()
+            if "error state" in err_msg or "could not find chat input" in err_msg:
+                # Page has a DNS/navigation error or UI is broken — attempt recovery
+                log.warning(f"Page error detected, attempting recovery: {e}")
+                from src.api.server import _browser
+                if _browser and await _browser.recover_page():
+                    # Retry after recovery
+                    try:
+                        result = await client.send_message(
+                            prompt,
+                            model=model_id,
+                            stateless=not Config.uses_browser(),
+                        )
+                    except Exception as e2:
+                        log.error(f"Provider error after recovery: {e2}", exc_info=True)
+                        raise HTTPException(
+                            status_code=500, detail=f"Provider error: {str(e2)}"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=503, detail="Browser page is in error state and recovery failed"
+                    )
+            else:
+                log.error(f"Provider error: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500, detail=f"Provider error: {str(e)}"
+                )
+        except Exception as e:
+            err_name = type(e).__name__
+            # TargetClosedError means browser/page crashed — try recovery
+            if "TargetClosed" in err_name or "closed" in str(e).lower():
+                log.warning(f"Browser/page crashed ({err_name}), attempting recovery...")
+                from src.api.server import _browser
+                if _browser and await _browser.recover_page():
+                    try:
+                        result = await client.send_message(
+                            prompt,
+                            model=model_id,
+                            stateless=not Config.uses_browser(),
+                        )
+                    except Exception as e2:
+                        log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
+                        raise HTTPException(
+                            status_code=500, detail=f"Provider error: {str(e2)}"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=503, detail=f"Browser crashed and recovery failed: {err_name}"
+                    )
+            else:
+                log.error(f"Provider error: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500, detail=f"Provider error: {str(e)}"
+                )
+
+        response_text = result.message
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # ── Detect echo ────────────────────────────────────
+        _echo_markers = [
+            "[System instruction:",
+            "tool-calling mode",
+            "Available functions:",
+        ]
+        if (
+            Config.uses_browser()
+            and response_text
+            and has_tool_prompt
+            and any(m in response_text for m in _echo_markers)
+        ):
+            log.warning(
+                "Response appears to echo the sent prompt — retrying extraction"
+            )
+            try:
+                await asyncio.sleep(1.5)
+                if Config.PROVIDER == "claude":
+                    from src.claude.detector import extract_last_response_via_copy
+                else:
+                    from src.chatgpt.detector import extract_last_response_via_copy
+
+                retry_text = await extract_last_response_via_copy(client.page)
+                if retry_text and not any(
+                    m in retry_text for m in _echo_markers
+                ):
+                    response_text = retry_text
+                    log.info(
+                        f"Retry extraction succeeded: {len(response_text)} chars"
+                    )
+                else:
+                    log.warning(
+                        "Retry extraction still echoed — stripping system prefix"
+                    )
+                    idx = response_text.rfind("\n\n")
+                    if idx > 0:
+                        tail = response_text[idx:].strip()
+                        if tail and not tail.startswith("["):
+                            response_text = tail
+            except Exception as e:
+                log.warning(f"Retry extraction failed: {e}")
+
+        # ── Check for tool calls ────────────────────────────
+        tool_calls = None
+        if has_tool_prompt and chat_tools:
+            tool_calls = _parse_tool_calls(response_text, chat_tools)
+            if tool_calls:
+                response_text = None
+
+        # ── Build response ──────────────────────────────────
+        prompt_tokens = _estimate_tokens(prompt)
+        completion_tokens = _estimate_tokens(response_text or "")
+
+        resp = _build_response_object(
+            response_text,
+            tool_calls,
+            request,
+            prompt_tokens,
+            completion_tokens,
+            model_id,
+        )
+
+        log.info(
+            f"Response: {elapsed_ms}ms, "
+            f"tool_calls={len(tool_calls) if tool_calls else 0}, "
+            f"tokens≈{resp.usage.total_tokens if resp.usage else 0}"
+        )
+
+        _increment_thread_count()
+
+        # ── Stream or return ────────────────────────────────
+        if request.stream:
+            return StreamingResponse(
+                _stream_response_events(resp, response_text, tool_calls),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        return resp.model_dump()

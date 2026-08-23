@@ -23,16 +23,17 @@ log = setup_logging("browser")
 
 def _resolve_domains_for_chrome() -> str:
     """
-    Pre-resolve key domains and return a --host-resolver-rules string
-    for Chrome. This works around Chrome's built-in DNS resolver
-    failing inside Docker containers.
+    Pre-resolve key domains via the OS and return a --host-resolver-rules
+    string for Chrome.
 
-    Returns empty string if not running in Docker or all resolutions fail.
+    Chrome's built-in DNS client (even with --disable-features=AsyncDns)
+    is unreliable — it can return DNS_PROBE_FINISHED_NXDOMAIN for domains
+    that the OS resolver handles fine.  By pre-resolving here and passing
+    the IPs via --host-resolver-rules, Chrome bypasses its own resolver
+    entirely and the problem disappears.
+
+    Returns empty string if all resolutions fail.
     """
-    # Only needed in Docker (check for /.dockerenv or DISPLAY=:99)
-    if not os.path.exists("/.dockerenv") and os.environ.get("DISPLAY") != ":99":
-        return ""
-
     domains = [
         "chatgpt.com",
         "cdn.oaistatic.com",
@@ -77,22 +78,32 @@ def _cleanup_stale_locks(data_dir: Path) -> None:
     - *-journal, *-wal, *-shm — SQLite journal/WAL files that cause
       "database is locked" errors (UKM, Top Sites, History, etc.)
 
-    We also attempt to kill any orphan chrome-for-testing processes.
+    We also attempt to kill any orphan Chromium processes that are using
+    our user-data-dir.
     """
     import subprocess
 
-    # 1. Kill orphan chrome-for-testing processes FIRST
-    try:
-        result = subprocess.run(
-            ["pkill", "-f", "chrome-for-testing"],
-            capture_output=True, timeout=3
-        )
-        if result.returncode == 0:
-            log.info("Killed orphan chrome processes")
-            import time
-            time.sleep(1)
-    except Exception:
-        pass  # Non-critical
+    # 1. Kill orphan Chromium processes FIRST.
+    #    Match multiple patterns: the macOS app name has spaces ("Google Chrome
+    #    for Testing"), Linux uses lowercase hyphens ("chrome-for-testing"),
+    #    and generic "chromium" for bundled builds.
+    kill_patterns = [
+        "Google Chrome for Testing",
+        "chrome-for-testing",
+        "chromium",
+    ]
+    for pattern in kill_patterns:
+        try:
+            result = subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                capture_output=True, timeout=3
+            )
+            if result.returncode == 0:
+                log.info(f"Killed orphan browser processes matching '{pattern}'")
+                import time
+                time.sleep(1)
+        except Exception:
+            pass  # Non-critical
 
     # 2. Remove singleton lock files
     lock_files = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
@@ -118,6 +129,54 @@ def _cleanup_stale_locks(data_dir: Path) -> None:
                 pass
     if removed:
         log.info(f"Removed {removed} stale SQLite journal/WAL/SHM files")
+
+    # 4. Clear ALL network / DNS / cache state that can corrupt Chrome's
+    #    resolver and cause DNS_PROBE_FINISHED_NXDOMAIN for every domain.
+    #    Chrome's built-in DNS client stores state in the persistent profile
+    #    that survives restarts and can poison resolution for ALL sites.
+    import shutil
+
+    # 4a. Delete network state files (DNS, QUIC, HTTP/3 connection cache)
+    network_files = [
+        "Default/Network Persistent State",
+        "Default/Network Action Predictor",
+        "Default/TransportSecurity",
+        "Default/Reporting and NEL",
+        "Default/SCT Auditing Pending Reports",
+        "Default/ServerCertificate",
+        "Default/DIPS",
+        "Default/Safe Browsing Cookies",
+    ]
+    for rel_path in network_files:
+        fpath = data_dir / rel_path
+        if fpath.exists():
+            try:
+                fpath.unlink()
+                log.info(f"Cleared network state: {rel_path}")
+            except Exception:
+                pass
+
+    # 4b. Delete cache directories (HTTP cache, compiled JS, GPU shaders).
+    #     These can grow large and contain stale connection/DNS info.
+    cache_dirs = [
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/DawnGraphiteCache",
+        "Default/DawnWebGPUCache",
+        "Default/Service Worker",
+        "GrShaderCache",
+        "GraphiteDawnCache",
+        "ShaderCache",
+    ]
+    for rel_dir in cache_dirs:
+        dpath = data_dir / rel_dir
+        if dpath.exists() and dpath.is_dir():
+            try:
+                shutil.rmtree(dpath, ignore_errors=True)
+                log.info(f"Cleared cache directory: {rel_dir}")
+            except Exception:
+                pass
 
 
 class BrowserManager:
@@ -152,6 +211,12 @@ class BrowserManager:
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
+            # Disable Chrome's built-in DNS client entirely.  Even with
+            # AsyncDns off, Chrome's stub resolver can return NXDOMAIN for
+            # domains the OS resolves fine.  We also pre-resolve domains
+            # via --host-resolver-rules (see _resolve_domains_for_chrome).
+            "--disable-features=AsyncDns,DnsOverHttps",
+            "--dns-prefetch-disable",
         ]
 
         # Docker-specific flags
@@ -162,8 +227,8 @@ class BrowserManager:
                 "--disable-gpu",
             ])
 
-        # In Docker, Chrome's DNS resolver can fail. Pre-resolve domains
-        # and pass them directly via --host-resolver-rules.
+        # Pre-resolve domains via the OS and hardcode the IPs for Chrome.
+        # This prevents Chrome's built-in DNS client from ever being used.
         resolver_rules = _resolve_domains_for_chrome()
         if resolver_rules:
             chrome_args.append(f"--host-resolver-rules={resolver_rules}")
@@ -200,8 +265,80 @@ class BrowserManager:
         else:
             self._page = await self._context.new_page()
 
+        # NOTE: We intentionally do NOT flush Chrome's DNS cache here.
+        # The --host-resolver-rules flag handles DNS resolution for all
+        # mapped domains.  Previously, _clear_dns_cache() would navigate
+        # to chrome://net-internals and flush the host cache + socket
+        # pools — but this destroyed working connection state and caused
+        # DNS_PROBE_FINISHED_NXDOMAIN on subsequent navigations.
+
         log.info(f"Browser ready — viewport {width}x{height}")
         return self._page
+
+    async def _clear_dns_cache(self) -> None:
+        """Clear Chrome's in-memory DNS host cache via chrome://net-internals."""
+        import asyncio as _asyncio
+
+        if self._page is None:
+            return
+
+        try:
+            await self._page.goto(
+                "chrome://net-internals/#dns",
+                wait_until="domcontentloaded",
+                timeout=10000,
+            )
+            await _asyncio.sleep(0.5)
+
+            # The "Clear host cache" button ID in chrome://net-internals/#dns
+            cleared = await self._page.evaluate(
+                """
+                () => {
+                    // Try the standard button
+                    const btn = document.getElementById('dns-view-clear-cache');
+                    if (btn) { btn.click(); return 'clicked-dns-view-clear-cache'; }
+                    // Newer Chrome: look for any button that says "Clear"
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    for (const b of buttons) {
+                        if (b.textContent.toLowerCase().includes('clear')) {
+                            b.click();
+                            return 'clicked-' + b.textContent.trim();
+                        }
+                    }
+                    return 'no-clear-button-found';
+                }
+                """
+            )
+            log.info(f"Chrome DNS cache flush: {cleared}")
+            await _asyncio.sleep(0.3)
+
+            # Also try to flush socket pools
+            try:
+                await self._page.goto(
+                    "chrome://net-internals/#sockets",
+                    wait_until="domcontentloaded",
+                    timeout=5000,
+                )
+                await _asyncio.sleep(0.3)
+                await self._page.evaluate(
+                    """
+                    () => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        for (const b of buttons) {
+                            if (b.textContent.toLowerCase().includes('flush') ||
+                                b.textContent.toLowerCase().includes('close')) {
+                                b.click();
+                            }
+                        }
+                    }
+                    """
+                )
+                log.info("Chrome socket pools flushed")
+            except Exception:
+                pass  # Best-effort
+
+        except Exception as e:
+            log.warning(f"Could not clear Chrome DNS cache: {e}")
 
     async def apply_stealth_patches(self) -> None:
         """
@@ -234,6 +371,78 @@ class BrowserManager:
         log.info(f"Navigating to {url}")
         await self.page.goto(url, wait_until="domcontentloaded")
         log.info("Page loaded")
+
+    async def recover_page(self) -> bool:
+        """Recover from DNS / page errors by re-navigating to ChatGPT.
+
+        Tries JS navigation first (avoids DNS lookup), then page.goto().
+        Returns True if recovery succeeded, False otherwise.
+        """
+        import asyncio as _asyncio
+
+        if self._page is None:
+            return False
+
+        # Strategy 1: JS navigation (doesn't go through Chrome's DNS resolver)
+        try:
+            log.info("Page recovery via JS navigation...")
+            await self._page.evaluate(f"window.location.href = '{Config.CHATGPT_URL}'")
+            await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await _asyncio.sleep(1)
+            error = await self._page.evaluate(
+                """
+                () => {
+                    const body = document.body ? document.body.innerText : '';
+                    if (body.includes('DNS_PROBE_FINISHED_NXDOMAIN')) return 'dns';
+                    if (body.includes('ERR_NAME_NOT_RESOLVED')) return 'dns';
+                    if (body.includes('ERR_CONNECTION_REFUSED')) return 'conn';
+                    return null;
+                }
+                """
+            )
+            if not error:
+                log.info("Page recovery succeeded (JS navigation)")
+                return True
+            log.warning(f"JS navigation recovery still shows error: {error}")
+        except Exception as e:
+            log.warning(f"JS navigation recovery failed: {e}")
+
+        # Strategy 2: page.goto() with retries
+        for attempt in range(1, 4):
+            try:
+                log.info(f"Page recovery attempt {attempt}/3 (page.goto)...")
+                await self._page.goto(
+                    Config.CHATGPT_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await _asyncio.sleep(1)
+
+                error = await self._page.evaluate(
+                    """
+                    () => {
+                        const body = document.body ? document.body.innerText : '';
+                        if (body.includes('DNS_PROBE_FINISHED_NXDOMAIN')) return 'dns';
+                        if (body.includes('ERR_NAME_NOT_RESOLVED')) return 'dns';
+                        if (body.includes('ERR_CONNECTION_REFUSED')) return 'conn';
+                        return null;
+                    }
+                    """
+                )
+                if error:
+                    log.warning(f"Recovery attempt {attempt} still shows error: {error}")
+                    await _asyncio.sleep(attempt * 2)
+                    continue
+
+                log.info("Page recovery succeeded")
+                return True
+
+            except Exception as e:
+                log.warning(f"Recovery attempt {attempt} failed: {e}")
+                await _asyncio.sleep(attempt * 2)
+
+        log.error("Page recovery failed after all attempts")
+        return False
 
     async def is_logged_in(self) -> bool:
         """

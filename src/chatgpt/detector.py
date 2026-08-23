@@ -12,6 +12,7 @@ import asyncio
 import re
 
 from patchright.async_api import Page
+from patchright._impl._errors import TargetClosedError
 
 from src.selectors import Selectors
 from src.browser.human import idle_mouse_movement
@@ -24,10 +25,8 @@ log = setup_logging("detector")
 def normalize_assistant_text(text: str | None) -> str:
     """Normalize extracted assistant text for validation and comparisons."""
     cleaned = (text or "").strip()
-    cleaned = re.sub(r"^ChatGPT said:\s*", "", cleaned,
-                     flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"^You said:\s*", "", cleaned,
-                     flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^ChatGPT said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^You said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned
 
 
@@ -54,7 +53,16 @@ def is_incomplete_response_text(text: str | None) -> bool:
     if any(marker in lower for marker in markers):
         if len(cleaned) < 240:
             return True
-        if lower.startswith(("pro thinking", "thinking", "searching", "analyzing", "working on", "gathering")):
+        if lower.startswith(
+            (
+                "pro thinking",
+                "thinking",
+                "searching",
+                "analyzing",
+                "working on",
+                "gathering",
+            )
+        ):
             return True
 
     return False
@@ -69,6 +77,37 @@ def _empty_snapshot() -> dict:
         "hasImage": False,
         "text": "",
     }
+
+
+async def _dump_all_turns(page: Page) -> list[dict]:
+    """Dump info about all conversation turns for debugging."""
+    try:
+        turns = await page.evaluate(
+            """
+            () => {
+                const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
+                return turns.map((turn, idx) => {
+                    const role = turn.getAttribute('data-turn') || 'unknown';
+                    const testid = turn.getAttribute('data-testid') || '';
+                    const turnId = turn.getAttribute('data-turn-id') || '';
+                    const text = (turn.innerText || '').trim().substring(0, 100);
+                    const buttons = turn.querySelectorAll('button').length;
+                    const copyBtn = Boolean(
+                        turn.querySelector('button[aria-label="Copy response"]') ||
+                        turn.querySelector('button[data-testid="copy-turn-action-button"]') ||
+                        turn.querySelector('button[aria-label="Copy message"]')
+                    );
+                    const hasArticle = Boolean(turn.querySelector('article'));
+                    const childTags = Array.from(turn.children).map(c => c.tagName).join(',');
+                    return { idx, role, testid, turnId, text, buttons, copyBtn, hasArticle, childTags };
+                });
+            }
+            """
+        )
+        return turns or []
+    except Exception as e:
+        log.debug(f"_dump_all_turns failed: {e}")
+        return []
 
 
 async def _latest_assistant_turn_snapshot(page: Page) -> dict:
@@ -166,7 +205,9 @@ async def count_assistant_messages(page: Page) -> int:
     return int(count or 0)
 
 
-async def _detect_image_in_latest_turn(page: Page, previous_turn_signature: str | None = None) -> bool:
+async def _detect_image_in_latest_turn(
+    page: Page, previous_turn_signature: str | None = None
+) -> bool:
     """Check if the newest assistant turn (not previous turn) contains an image."""
     snapshot = await _latest_assistant_turn_snapshot(page)
     signature = snapshot.get("signature")
@@ -215,14 +256,18 @@ async def _wait_for_new_turn_signature(
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)
         signature = snapshot.get("signature")
-        if isinstance(signature, str) and signature and signature != previous_turn_signature:
+        if (
+            isinstance(signature, str)
+            and signature
+            and signature != previous_turn_signature
+        ):
             log.debug(
-                f"New assistant turn detected: {signature} (prev: {previous_turn_signature})")
+                f"New assistant turn detected: {signature} (prev: {previous_turn_signature})"
+            )
             return True
 
         if elapsed > 0 and elapsed % heartbeat == 0:
-            log.debug(
-                f"Still waiting for new assistant turn... ({int(elapsed)}s)")
+            log.debug(f"Still waiting for new assistant turn... ({int(elapsed)}s)")
 
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
@@ -249,23 +294,25 @@ async def wait_for_response_complete(
     log.debug(f"Copy buttons before send: {pre_copy_count}")
 
     if previous_turn_signature:
-        log.debug(
-            f"Previous assistant turn signature: {previous_turn_signature}")
-        await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=30000)
+        log.debug(f"Previous assistant turn signature: {previous_turn_signature}")
+        await _wait_for_new_turn_signature(
+            page, previous_turn_signature, timeout_ms=30000
+        )
     elif expected_msg_count is not None:
         log.debug(f"Waiting for assistant message #{expected_msg_count}...")
         waited = 0
         while waited < 30000:
             current_count = await count_assistant_messages(page)
             if current_count >= expected_msg_count:
-                log.debug(
-                    f"Assistant message target reached (count: {current_count})")
+                log.debug(f"Assistant message target reached (count: {current_count})")
                 break
             await asyncio.sleep(0.5)
             waited += 500
 
     log.debug("Waiting for copy button or image on latest assistant turn...")
-    completed = await _wait_for_copy_button_or_image(page, pre_copy_count, timeout, previous_turn_signature)
+    completed = await _wait_for_copy_button_or_image(
+        page, timeout, previous_turn_signature
+    )
     if completed == "copy":
         log.info("Response complete — copy button appeared on latest turn")
         return True
@@ -289,9 +336,37 @@ async def wait_for_response_complete(
         return False
 
 
+async def _check_page_error(page: Page) -> str | None:
+    """Check if the page is showing an error state (DNS failure, crash, etc.).
+
+    Returns error description string if an error is detected, None otherwise.
+    """
+    try:
+        error = await page.evaluate(
+            """
+            () => {
+                // Chrome error pages
+                const body = document.body ? document.body.innerText : '';
+                if (body.includes('DNS_PROBE_FINISHED_NXDOMAIN')) return 'DNS_PROBE_FINISHED_NXDOMAIN';
+                if (body.includes('ERR_NAME_NOT_RESOLVED')) return 'ERR_NAME_NOT_RESOLVED';
+                if (body.includes('ERR_CONNECTION_REFUSED')) return 'ERR_CONNECTION_REFUSED';
+                if (body.includes('ERR_INTERNET_DISCONNECTED')) return 'ERR_INTERNET_DISCONNECTED';
+                if (body.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
+                // ChatGPT error states
+                if (body.includes('Something went wrong')) return 'ChatGPT_something_went_wrong';
+                if (body.includes("We're experiencing high demand")) return 'ChatGPT_high_demand';
+                if (document.title && document.title.includes('is not available')) return 'page_not_available';
+                return null;
+            }
+            """
+        )
+        return error
+    except Exception:
+        return None
+
+
 async def _wait_for_copy_button_or_image(
     page: Page,
-    pre_count: int,
     timeout_ms: int,
     previous_turn_signature: str | None = None,
 ) -> str | None:
@@ -315,21 +390,45 @@ async def _wait_for_copy_button_or_image(
     elapsed = 0
     poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
+    next_heartbeat = heartbeat
+    first_snapshot_logged = False
 
     required_stable_polls = 2
     stable_polls = 0
     last_text: str | None = None
 
     while elapsed * 1000 < timeout_ms:
-        snapshot = await _latest_assistant_turn_snapshot(page)
+        try:
+            snapshot = await _latest_assistant_turn_snapshot(page)
+        except TargetClosedError:
+            log.error("Page/browser closed while waiting for response")
+            return None
+        except Exception as e:
+            log.warning(f"Snapshot failed ({type(e).__name__}): {e}")
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            continue
+
         signature = snapshot.get("signature")
         is_new_turn = previous_turn_signature is None or (
             isinstance(signature, str) and signature != previous_turn_signature
         )
 
+        # Log the first snapshot for diagnostics
+        if not first_snapshot_logged and elapsed >= 2:
+            first_snapshot_logged = True
+            turn_text = (snapshot.get("text") or "")[:200]
+            all_turns = await _dump_all_turns(page)
+            log.debug(
+                f"First snapshot at {int(elapsed)}s | "
+                f"prev_sig={previous_turn_signature} cur_sig={signature} "
+                f"is_new={is_new_turn} copy={snapshot.get('hasCopyButton')} "
+                f"text[:{len(turn_text)}]={turn_text!r}"
+            )
+            log.debug(f"All turns ({len(all_turns)}): {all_turns}")
+
         if is_new_turn:
-            text = snapshot.get("text") if isinstance(
-                snapshot.get("text"), str) else ""
+            text = snapshot.get("text") if isinstance(snapshot.get("text"), str) else ""
 
             if text and text == last_text:
                 stable_polls += 1
@@ -342,7 +441,7 @@ async def _wait_for_copy_button_or_image(
                     current_count = await _count_copy_buttons(page)
                     log.debug(
                         f"Copy button detected and text stable on latest turn {signature} "
-                        f"(copy-buttons: {pre_count} -> {current_count})"
+                        f"(copy-buttons: {current_count})"
                     )
                     return "copy"
                 else:
@@ -352,19 +451,44 @@ async def _wait_for_copy_button_or_image(
                         "-- still streaming, continuing to wait"
                     )
 
-        has_image = await _detect_image_in_latest_turn(page, previous_turn_signature)
-        if has_image:
-            await asyncio.sleep(1.0)
-            log.debug(f"Generated image detected on latest turn {signature}")
+        # Use snapshot data directly instead of a separate evaluate call
+        if is_new_turn and snapshot.get("hasImage"):
+            await asyncio.sleep(0.5)
+            log.info(f"Generated image detected on latest turn {signature}")
             return "image"
 
-        if elapsed > 0 and elapsed % heartbeat == 0:
+        if elapsed >= next_heartbeat:
+            next_heartbeat = elapsed + heartbeat
+            # Diagnostic: log what we see on the latest assistant turn
+            turn_text = (snapshot.get("text") or "")[:200]
             log.debug(
-                f"Still waiting for copy button or image... ({int(elapsed)}s)")
+                f"Still waiting for copy/image... ({int(elapsed)}s) | "
+                f"sig={signature} is_new={is_new_turn} "
+                f"copy={snapshot.get('hasCopyButton')} "
+                f"text[:{len(turn_text)}]={turn_text!r}"
+            )
+
+            # Dump all turn info for debugging
+            all_turns = await _dump_all_turns(page)
+            log.debug(f"All turns: {all_turns}")
+
             await idle_mouse_movement(page)
+
+            # Check for page-level errors every heartbeat to fail fast
+            page_error = await _check_page_error(page)
+            if page_error:
+                log.error(f"Page error detected while waiting: {page_error}")
+                return None
 
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
+
+    # Diagnostic: save screenshot on timeout
+    try:
+        await page.screenshot(path="logs/detector_timeout.png")
+        log.info("Saved timeout screenshot to logs/detector_timeout.png")
+    except Exception as e:
+        log.debug(f"Could not save timeout screenshot: {e}")
 
     log.warning(f"Neither copy button nor image found after {int(elapsed)}s")
     return None
@@ -388,7 +512,9 @@ async def _wait_via_stop_button(page: Page, timeout_ms: int) -> bool:
 
     while elapsed * 1000 < timeout_ms:
         try:
-            await page.wait_for_selector(stop_selector, state="hidden", timeout=heartbeat_interval * 1000)
+            await page.wait_for_selector(
+                stop_selector, state="hidden", timeout=heartbeat_interval * 1000
+            )
             log.info("Stop button disappeared — streaming done")
             return True
         except Exception:
@@ -419,8 +545,7 @@ async def _wait_via_text_stability(
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)
         signature = snapshot.get("signature")
-        text = snapshot.get("text") if isinstance(
-            snapshot.get("text"), str) else ""
+        text = snapshot.get("text") if isinstance(snapshot.get("text"), str) else ""
 
         if previous_turn_signature and signature == previous_turn_signature:
             stable_count = 0
@@ -433,9 +558,12 @@ async def _wait_via_text_stability(
             stable_count += 1
             log.debug(f"Text stable ({stable_count}/{required_stable})")
             if stable_count >= required_stable:
-                if is_incomplete_response_text(text) and not bool(snapshot.get("hasCopyButton")):
+                if is_incomplete_response_text(text) and not bool(
+                    snapshot.get("hasCopyButton")
+                ):
                     log.debug(
-                        "Stable text looks like transient thinking status; continuing wait")
+                        "Stable text looks like transient thinking status; continuing wait"
+                    )
                     stable_count = 0
                     last_text = text
                     await asyncio.sleep(poll_interval)
@@ -469,9 +597,13 @@ async def extract_last_response_via_copy(
         await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
 
         if previous_turn_signature:
-            await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=8000)
+            await _wait_for_new_turn_signature(
+                page, previous_turn_signature, timeout_ms=8000
+            )
 
-        pre_clipboard = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
+        pre_clipboard = await page.evaluate(
+            "navigator.clipboard.readText().catch(() => '')"
+        )
         await page.evaluate("navigator.clipboard.writeText('').catch(() => {})")
 
         click_result = await page.evaluate(
@@ -516,9 +648,15 @@ async def extract_last_response_via_copy(
         )
 
         if isinstance(click_result, dict) and click_result.get("clicked"):
-            await asyncio.sleep(0.8)
-            content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
-            if content and content.strip() and content.strip() != str(pre_clipboard).strip():
+            await asyncio.sleep(0.3)
+            content = await page.evaluate(
+                "navigator.clipboard.readText().catch(() => '')"
+            )
+            if (
+                content
+                and content.strip()
+                and content.strip() != str(pre_clipboard).strip()
+            ):
                 log.info(
                     "Extracted via copy button (latest-turn): "
                     f"{len(content)} chars, turn={click_result.get('signature')}"
@@ -526,8 +664,11 @@ async def extract_last_response_via_copy(
                 return content.strip()
             log.debug("Clipboard unchanged/empty after latest-turn copy click")
         else:
-            reason = click_result.get("reason") if isinstance(
-                click_result, dict) else "unknown"
+            reason = (
+                click_result.get("reason")
+                if isinstance(click_result, dict)
+                else "unknown"
+            )
             log.debug(f"Latest-turn copy click not used: {reason}")
 
     except Exception as e:
@@ -578,7 +719,8 @@ async def _extract_via_dom(
         cleaned = normalize_assistant_text(str(text))
         if is_incomplete_response_text(cleaned):
             log.debug(
-                "Latest-turn DOM text looks incomplete/transient; waiting for a fuller reply")
+                "Latest-turn DOM text looks incomplete/transient; waiting for a fuller reply"
+            )
             return ""
         log.debug(f"Extracted via DOM (latest-turn): {len(cleaned)} chars")
         return cleaned

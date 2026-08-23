@@ -162,3 +162,126 @@ class ImagesResponse(BaseModel):
     """OpenAI-compatible image generation response."""
     created: int = Field(default_factory=lambda: int(time.time()))
     data: List[ImageData]
+
+
+# ── Responses API (/v1/responses) ───────────────────────────────
+
+
+class ResponsesToolDefinition(BaseModel):
+    """Flat tool definition used by the Responses API.
+
+    Unlike the Chat Completions API which nests under `function:`,
+    the Responses API uses a flat format:
+      {"type": "function", "name": "...", "parameters": {...}, "description": "..."}
+    """
+    type: str = "function"
+    name: str
+    description: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    strict: Optional[bool] = None
+
+
+class ResponsesInputMessage(BaseModel):
+    """A message in the Responses API input array."""
+    role: str  # "user" | "assistant" | "system" | "developer"
+    content: Union[str, List[Any]]
+
+
+class ResponsesFunctionCallInput(BaseModel):
+    """A function_call item in the Responses API input (assistant called a tool)."""
+    type: str = "function_call"
+    id: Optional[str] = None
+    call_id: str
+    name: str
+    arguments: str
+
+
+class ResponsesFunctionCallOutputInput(BaseModel):
+    """A function_call_output item in the Responses API input (tool result)."""
+    type: str = "function_call_output"
+    call_id: str
+    output: str
+
+
+class ResponsesRequest(BaseModel):
+    """Request body for POST /v1/responses."""
+    model: str = "catgpt-browser"
+    input: Union[str, List[Any]]  # string or array of messages/items
+    instructions: Optional[str] = None  # system prompt
+    tools: Optional[List[ResponsesToolDefinition]] = None
+    tool_choice: Optional[Union[str, dict]] = None
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    previous_response_id: Optional[str] = None
+    truncation: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    store: Optional[bool] = None
+
+
+# ── Responses API output models ─────────────────────────────────
+
+
+class ResponseOutputText(BaseModel):
+    """Text content in a Responses API output message."""
+    type: str = "output_text"
+    text: str = ""
+    annotations: List[Any] = Field(default_factory=list)
+
+
+class ResponseOutputMessage(BaseModel):
+    """A message output item in the Responses API."""
+    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
+    type: str = "message"
+    role: str = "assistant"
+    status: str = "completed"
+    content: List[ResponseOutputText] = Field(default_factory=list)
+
+
+class ResponseFunctionCall(BaseModel):
+    """A function_call output item in the Responses API."""
+    id: str = Field(default_factory=lambda: f"fc_{uuid.uuid4().hex[:24]}")
+    type: str = "function_call"
+    call_id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:24]}")
+    name: str
+    arguments: str
+    status: str = "completed"
+
+
+class ResponseUsage(BaseModel):
+    """Usage info for the Responses API."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    output_tokens_details: dict[str, int] = Field(
+        default_factory=lambda: {"reasoning_tokens": 0}
+    )
+    total_tokens: int = 0
+
+
+class ResponseObject(BaseModel):
+    """The full response object returned by POST /v1/responses."""
+    id: str = Field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:24]}")
+    object: str = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    status: str = "completed"
+    completed_at: Optional[int] = None
+    error: Optional[dict[str, Any]] = None
+    incomplete_details: Optional[dict[str, Any]] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    model: str = "catgpt-browser"
+    output: List[Any] = Field(default_factory=list)
+    output_text: Optional[str] = None
+    parallel_tool_calls: bool = True
+    previous_response_id: Optional[str] = None
+    temperature: Optional[float] = 1.0
+    text: dict[str, Any] = Field(default_factory=lambda: {"format": {"type": "text"}})
+    tool_choice: Optional[Union[str, dict]] = "auto"
+    tools: List[Any] = Field(default_factory=list)
+    top_p: Optional[float] = 1.0
+    truncation: Optional[str] = "disabled"
+    usage: Optional[ResponseUsage] = None
+    user: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
