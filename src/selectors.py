@@ -82,10 +82,17 @@ class Selectors:
     # ── Copy button (appears on each completed assistant message) ──────
     # This is the most reliable completion signal — it only appears
     # after the full response has been generated.
+    # NOTE: aria-label is confirmed as "Copy response" (not "Copy message").
+    # The bare button[aria-label='Copy'] fallback was dropped — it's broad
+    # enough to also match a code block's own copy button, and since these
+    # selectors used to be joined into a single combined querySelector()
+    # call, DOM order (not list order) decided which one actually got
+    # clicked. detector.py now tries these as a genuine ordered fallback
+    # chain (separate querySelector calls joined with ||) instead.
     COPY_BUTTON = [
+        "button[aria-label='Copy response']",
         "button[data-testid='copy-turn-action-button']",
         "button[aria-label='Copy message']",
-        "button[aria-label='Copy']",
     ]
 
     # ── Generated images inside assistant responses ───────────────────
