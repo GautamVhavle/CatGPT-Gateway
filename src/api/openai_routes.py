@@ -965,9 +965,6 @@ async def create_image(
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
-
         # Send to ChatGPT
         try:
             result = await client.send_message(full_prompt)
@@ -1927,8 +1924,6 @@ async def create_response(
             f"tokens≈{resp.usage.total_tokens if resp.usage else 0}"
         )
 
-        _increment_thread_count()
-
         # ── Stream or return ────────────────────────────────
         if request.stream:
             return StreamingResponse(
@@ -2018,7 +2013,6 @@ async def create_anthropic_message(request: Request):
 
         prompt_tokens = _estimate_tokens(prompt)
         completion_tokens = _estimate_tokens(response_text)
-        _increment_thread_count()
 
         log.info(
             f"Anthropic Response: {elapsed_ms}ms, "
