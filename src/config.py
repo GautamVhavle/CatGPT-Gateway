@@ -52,7 +52,9 @@ class Config:
         or MINIMAX_BASE_URLS.get(MINIMAX_REGION, MINIMAX_BASE_URLS["global_en"])
     ).rstrip("/")
     MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "").strip()
-    MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M2.7",)
+    # Current discovery catalog; explicit legacy/configured IDs remain usable.
+    MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M3.1-Flash", "MiniMax-M3")
+    MINIMAX_LEGACY_MODEL_IDS: tuple[str, ...] = ("MiniMax-M2.7",)
     MINIMAX_MODEL: str = os.getenv(
         "MINIMAX_MODEL", MINIMAX_MODEL_IDS[0]
     ).strip()
@@ -98,12 +100,8 @@ class Config:
                     f"Unsupported MiniMax region '{cls.MINIMAX_REGION}'. "
                     f"Choose one of: {supported}"
                 )
-            if cls.MINIMAX_MODEL not in cls.MINIMAX_MODEL_IDS:
-                supported = ", ".join(cls.MINIMAX_MODEL_IDS)
-                raise ValueError(
-                    f"Unsupported MiniMax model '{cls.MINIMAX_MODEL}'. "
-                    f"Choose one of: {supported}"
-                )
+            if not cls.MINIMAX_MODEL:
+                raise ValueError("MINIMAX_MODEL must not be empty")
 
     @classmethod
     def uses_browser(cls) -> bool:
@@ -127,6 +125,13 @@ class Config:
         return cls.provider_model_ids()[0]
 
     @classmethod
+    def supports_minimax_model(cls, model: str) -> bool:
+        """Keep explicit legacy IDs and the operator's custom default usable."""
+        return bool(model) and model in (
+            *cls.MINIMAX_MODEL_IDS, *cls.MINIMAX_LEGACY_MODEL_IDS, cls.MINIMAX_MODEL
+        )
+
+    @classmethod
     def resolve_model_id(cls, requested: str | None) -> str:
         """Resolve request defaults and validate MiniMax model IDs."""
         if cls.PROVIDER != "minimax":
@@ -134,7 +139,7 @@ class Config:
 
         if not requested or requested in {"catgpt-browser", "claude-browser"}:
             return cls.MINIMAX_MODEL
-        if requested not in cls.MINIMAX_MODEL_IDS:
+        if not cls.supports_minimax_model(requested):
             supported = ", ".join(cls.MINIMAX_MODEL_IDS)
             raise ValueError(
                 f"Unsupported MiniMax model '{requested}'. Choose one of: {supported}"

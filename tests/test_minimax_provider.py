@@ -62,6 +62,7 @@ class RecordingProviderClient:
         file_paths=None,
         model: str | None = None,
         stateless: bool = False,
+        page=None,
     ) -> ChatResponse:
         self.model = model
         return ChatResponse(message="Provider response", thread_id="thread-id")
@@ -81,7 +82,7 @@ class MiniMaxProviderTests(unittest.TestCase):
         )
         self.assertEqual(
             Config.MINIMAX_MODEL_IDS,
-            ("MiniMax-M2.7",),
+            ("MiniMax-M3.1-Flash", "MiniMax-M3"),
         )
 
     def test_client_uses_selected_endpoint_and_model(self) -> None:
@@ -112,17 +113,55 @@ class MiniMaxProviderTests(unittest.TestCase):
             [{"role": "user", "content": "Hello"}],
         )
 
+    def test_current_models_reach_both_api_regions_unchanged(self) -> None:
+        for endpoint in Config.MINIMAX_BASE_URLS.values():
+            for model in Config.MINIMAX_MODEL_IDS:
+                with self.subTest(endpoint=endpoint, model=model):
+                    opener = RecordingOpener()
+                    client = MiniMaxClient(api_key="test-key", base_url=endpoint, opener=opener)
+                    asyncio.run(client.send_message("Hello", model=model))
+                    self.assertEqual(opener.request.full_url, endpoint + "/chat/completions")
+                    payload = json.loads(opener.request.data)
+                    self.assertEqual(payload["model"], model)
+                    self.assertEqual(set(payload), {"model", "messages"})
+
+    def test_configured_legacy_and_custom_defaults_are_preserved(self) -> None:
+        for model in ("MiniMax-M2.7", "custom-minimax-deployment"):
+            with patch.object(Config, "PROVIDER", "minimax"), patch.object(Config, "MINIMAX_MODEL", model):
+                Config.validate_provider()
+                self.assertEqual(Config.resolve_model_id(None), model)
+                self.assertEqual(Config.resolve_model_id(model), model)
+                self.assertEqual(Config.provider_model_ids(), ("MiniMax-M3.1-Flash", "MiniMax-M3"))
+                opener = RecordingOpener()
+                client = MiniMaxClient(api_key="test-key", opener=opener)
+                asyncio.run(client.send_message("Hello"))
+                self.assertEqual(json.loads(opener.request.data)["model"], model)
+
+    def test_unknown_request_model_is_rejected(self) -> None:
+        with patch.object(Config, "PROVIDER", "minimax"):
+            with self.assertRaises(ValueError):
+                Config.resolve_model_id("typo-model")
+        with self.assertRaises(ValueError):
+            MiniMaxClient(api_key="test-key", model="typo-model")
+
+    def test_non_minimax_provider_defaults_are_unchanged(self) -> None:
+        for provider, model in (("chatgpt", "catgpt-browser"), ("claude", "claude-browser")):
+            with patch.object(Config, "PROVIDER", provider):
+                self.assertEqual(Config.provider_model_ids(), (model,))
+                self.assertEqual(Config.default_model_id(), model)
+                self.assertTrue(Config.uses_browser())
+
     def test_models_endpoint_lists_target_models(self) -> None:
         with patch.object(Config, "PROVIDER", "minimax"):
             response = asyncio.run(openai_routes.list_models())
 
         self.assertEqual(
             [model.id for model in response.data],
-            ["MiniMax-M2.7"],
+            ["MiniMax-M3.1-Flash", "MiniMax-M3"],
         )
         self.assertEqual(
             [model.owned_by for model in response.data],
-            ["minimax"],
+            ["minimax", "minimax"],
         )
 
     def test_chat_route_maps_default_request_model(self) -> None:
@@ -131,54 +170,39 @@ class MiniMaxProviderTests(unittest.TestCase):
             messages=[ChatMessage(role="user", content="Hello")]
         )
         previous_client = openai_routes._client
-        previous_lock = openai_routes._lock
-        previous_count = openai_routes._thread_message_count
-        previous_response_time = openai_routes._last_response_time
 
         try:
             openai_routes._client = client
-            openai_routes._lock = None
-            openai_routes._thread_message_count = 0
-            openai_routes._last_response_time = 0.0
             with patch.object(Config, "PROVIDER", "minimax"):
                 response = asyncio.run(
-                    openai_routes.create_chat_completion(request)
+                    openai_routes.create_chat_completion(request, None)
                 )
 
-            self.assertEqual(client.model, "MiniMax-M2.7")
-            self.assertEqual(response.model, "MiniMax-M2.7")
+            self.assertEqual(client.model, "MiniMax-M3.1-Flash")
+            self.assertEqual(response.model, "MiniMax-M3.1-Flash")
         finally:
             openai_routes._client = previous_client
-            openai_routes._lock = previous_lock
-            openai_routes._thread_message_count = previous_count
-            openai_routes._last_response_time = previous_response_time
 
     def test_openai_requests_start_with_isolated_provider_history(self) -> None:
         opener = RecordingOpener()
         client = MiniMaxClient(api_key="test-key", opener=opener)
         previous_client = openai_routes._client
-        previous_lock = openai_routes._lock
-        previous_count = openai_routes._thread_message_count
-        previous_response_time = openai_routes._last_response_time
 
         try:
             openai_routes._client = client
-            openai_routes._lock = None
-            openai_routes._thread_message_count = 0
-            openai_routes._last_response_time = 0.0
             with patch.object(Config, "PROVIDER", "minimax"):
                 asyncio.run(
                     openai_routes.create_chat_completion(
                         ChatCompletionRequest(
                             messages=[ChatMessage(role="user", content="first secret")]
-                        )
+                        ), None
                     )
                 )
                 asyncio.run(
                     openai_routes.create_chat_completion(
                         ChatCompletionRequest(
                             messages=[ChatMessage(role="user", content="second request")]
-                        )
+                        ), None
                     )
                 )
 
@@ -190,9 +214,6 @@ class MiniMaxProviderTests(unittest.TestCase):
             self.assertEqual(client._messages, [])
         finally:
             openai_routes._client = previous_client
-            openai_routes._lock = previous_lock
-            openai_routes._thread_message_count = previous_count
-            openai_routes._last_response_time = previous_response_time
 
     def test_chat_route_rejects_minimax_attachments_before_provider(self) -> None:
         client = RecordingProviderClient()
@@ -216,7 +237,7 @@ class MiniMaxProviderTests(unittest.TestCase):
         try:
             with patch.object(Config, "PROVIDER", "minimax"):
                 with self.assertRaises(HTTPException) as raised:
-                    asyncio.run(openai_routes.create_chat_completion(request))
+                    asyncio.run(openai_routes.create_chat_completion(request, None))
 
             self.assertEqual(raised.exception.status_code, 501)
             self.assertIsNone(client.model)
@@ -256,7 +277,7 @@ class MiniMaxProviderTests(unittest.TestCase):
                 asyncio.run(run_lifespan())
 
             set_client.assert_called_once_with(fake_client, None)
-            set_openai_client.assert_called_once_with(fake_client)
+            set_openai_client.assert_called_once_with(fake_client, None)
         finally:
             server._browser = None
             server._client = None

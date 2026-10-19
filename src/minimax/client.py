@@ -39,7 +39,7 @@ class MiniMaxClient:
 
         self._base_url = (base_url or Config.MINIMAX_BASE_URL).rstrip("/")
         self._model = model or Config.MINIMAX_MODEL
-        if self._model not in Config.MINIMAX_MODEL_IDS:
+        if not Config.supports_minimax_model(self._model):
             supported = ", ".join(Config.MINIMAX_MODEL_IDS)
             raise ValueError(
                 f"Unsupported MiniMax model '{self._model}'. Choose one of: {supported}"
@@ -59,8 +59,9 @@ class MiniMaxClient:
         file_paths: list[str] | None = None,
         model: str | None = None,
         stateless: bool = False,
+        page: Any = None,
     ) -> ChatResponse:
-        """Send a text message and return a normalized provider response."""
+        """Send a text message; the shared browser page argument is unused."""
         if image_paths or file_paths:
             raise RuntimeError(
                 "File attachments are not supported by the MiniMax provider client"
@@ -149,7 +150,7 @@ class MiniMaxClient:
 
     def _resolve_model(self, requested: str | None) -> str:
         model_id = requested or self._model
-        if model_id not in Config.MINIMAX_MODEL_IDS:
+        if not Config.supports_minimax_model(model_id):
             supported = ", ".join(Config.MINIMAX_MODEL_IDS)
             raise ValueError(
                 f"Unsupported MiniMax model '{model_id}'. Choose one of: {supported}"
