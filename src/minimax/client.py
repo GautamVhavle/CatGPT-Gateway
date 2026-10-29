@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import mimetypes
+import os
 import time
 import uuid
 from typing import Any, Callable
@@ -47,9 +50,9 @@ class MiniMaxClient:
 
         self._timeout_seconds = timeout_seconds or Config.RESPONSE_TIMEOUT / 1000
         self._opener = opener
-        self._threads: dict[str, list[dict[str, str]]] = {}
+        self._threads: dict[str, list[dict[str, Any]]] = {}
         self._thread_id = ""
-        self._messages: list[dict[str, str]] = []
+        self._messages: list[dict[str, Any]] = []
         self._start_thread()
 
     async def send_message(
@@ -59,16 +62,16 @@ class MiniMaxClient:
         file_paths: list[str] | None = None,
         model: str | None = None,
         stateless: bool = False,
+        page: Any | None = None,
     ) -> ChatResponse:
         """Send a text message and return a normalized provider response."""
-        if image_paths or file_paths:
-            raise RuntimeError(
-                "File attachments are not supported by the MiniMax provider client"
-            )
-
         model_id = self._resolve_model(model)
         start_time = time.time()
-        user_message = {"role": "user", "content": text}
+        content: str | list[dict[str, Any]] = text
+        attachments = self._attachment_parts(image_paths or [], file_paths or [])
+        if attachments:
+            content = [{"type": "text", "text": text}, *attachments]
+        user_message = {"role": "user", "content": content}
         if stateless:
             request_messages = [user_message]
         else:
@@ -155,6 +158,28 @@ class MiniMaxClient:
                 f"Unsupported MiniMax model '{model_id}'. Choose one of: {supported}"
             )
         return model_id
+
+    @staticmethod
+    def _attachment_parts(image_paths: list[str], file_paths: list[str]) -> list[dict[str, Any]]:
+        """Convert gateway attachment paths/URLs to OpenAI-compatible parts."""
+        parts: list[dict[str, Any]] = []
+        for path in [*image_paths, *file_paths]:
+            value = str(path)
+            mime, _ = mimetypes.guess_type(value.split("?", 1)[0])
+            if value.startswith("data:"):
+                header = value.split(",", 1)[0]
+                mime = header.split(":", 1)[1].split(";", 1)[0] if ":" in header else mime
+            is_video = bool(mime and mime.startswith("video/"))
+            if os.path.isfile(value):
+                with open(value, "rb") as handle:
+                    encoded = base64.b64encode(handle.read()).decode("ascii")
+                mime = mime or "application/octet-stream"
+                value = f"data:{mime};base64,{encoded}"
+            if is_video:
+                parts.append({"type": "video_url", "video_url": {"url": value}})
+            else:
+                parts.append({"type": "image_url", "image_url": {"url": value}})
+        return parts
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = Request(

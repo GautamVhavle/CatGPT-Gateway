@@ -455,20 +455,24 @@ def _extract_content_text(content) -> str:
     return str(content)
 
 
-def _extract_image_urls(content) -> list[str]:
-    """Extract image URLs from message content (OpenAI vision format)."""
+def _extract_media_urls(content) -> list[str]:
+    """Extract image and video URLs from OpenAI-compatible content parts."""
     if not isinstance(content, list):
         return []
     urls = []
     for item in content:
-        if isinstance(item, dict) and item.get("type") == "image_url":
-            image_url = item.get("image_url", {})
-            if isinstance(image_url, dict):
-                url = image_url.get("url", "")
-            else:
-                url = str(image_url)
-            if url:
-                urls.append(url)
+        if not isinstance(item, dict):
+            continue
+        part_type = item.get("type")
+        if part_type not in {"image_url", "video_url"}:
+            continue
+        media_url = item.get(part_type, {})
+        if isinstance(media_url, dict):
+            url = media_url.get("url", "")
+        else:
+            url = str(media_url)
+        if url:
+            urls.append(url)
     return urls
 
 
@@ -482,7 +486,8 @@ def _extract_file_attachments(content) -> list[dict]:
     Also supports a shorthand data-URL style:
       {"type": "file", "file": {"filename": "test.pdf", "url": "data:application/pdf;base64,..."}}
 
-    Returns list of dicts: [{"filename": str, "data_b64": str, "mime_type": str}, ...]
+    Returns normalized attachment dictionaries containing either ``url`` or
+    ``data_b64`` plus filename and MIME type metadata.
     """
     if not isinstance(content, list):
         return []
@@ -508,7 +513,9 @@ def _extract_file_attachments(content) -> list[dict]:
                     mime_type = header.split(":")[1].split(";")[0]
             except ValueError:
                 continue
-        if data_b64:
+        if url:
+            files.append({"filename": filename, "url": url, "mime_type": mime_type})
+        elif data_b64:
             files.append({"filename": filename, "data_b64": data_b64, "mime_type": mime_type})
     return files
 
@@ -519,9 +526,43 @@ def _contains_attachment(content) -> bool:
         return any(_contains_attachment(item) for item in content)
     if not isinstance(content, dict):
         return False
-    if content.get("type") in {"image_url", "file", "input_image", "input_file"}:
+    if content.get("type") in {
+        "image_url",
+        "video_url",
+        "file",
+        "input_image",
+        "input_video",
+        "input_file",
+    }:
         return True
     return any(_contains_attachment(value) for value in content.values())
+
+
+async def _extract_message_attachments(
+    messages: list[ChatMessage],
+) -> tuple[list[str], list[str]]:
+    """Resolve user-message media into paths or direct provider URLs."""
+    media_paths: list[str] = []
+    file_paths: list[str] = []
+    for message in messages:
+        if message.role != "user" or not isinstance(message.content, list):
+            continue
+        for url in _extract_media_urls(message.content):
+            resolved = url if Config.PROVIDER == "minimax" else await _download_file(url)
+            if resolved:
+                media_paths.append(resolved)
+        for attachment in _extract_file_attachments(message.content):
+            if Config.PROVIDER == "minimax":
+                resolved = attachment.get("url") or (
+                    f"data:{attachment.get('mime_type', 'application/octet-stream')};"
+                    f"base64,{attachment['data_b64']}"
+                )
+            else:
+                source = attachment if attachment.get("data_b64") else attachment.get("url", "")
+                resolved = await _download_file(source)
+            if resolved:
+                file_paths.append(resolved)
+    return media_paths, file_paths
 
 
 async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catgpt_files") -> str | None:
@@ -1158,14 +1199,6 @@ async def create_chat_completion(
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
-    if Config.PROVIDER == "minimax" and any(
-        _contains_attachment(message.content) for message in request.messages
-    ):
-        raise HTTPException(
-            status_code=501,
-            detail="Attachments are not supported by the MiniMax provider.",
-        )
-
     client = _get_client()
     model_id = _resolve_model_id(request.model)
     session_id = _extract_session_id(raw_request, getattr(request, "user", None))
@@ -1210,24 +1243,14 @@ async def create_chat_completion(
         )
 
         # ── Extract attachments from active messages ────────
-        image_paths: list[str] = []
-        file_paths: list[str] = []
-        for msg in active_messages:
-            if msg.role == "user" and isinstance(msg.content, list):
-                image_urls = _extract_image_urls(msg.content)
-                for url in image_urls:
-                    local_path = await _download_file(url)
-                    if local_path:
-                        image_paths.append(local_path)
-                file_attachments = _extract_file_attachments(msg.content)
-                for fa in file_attachments:
-                    local_path = await _download_file(fa)
-                    if local_path:
-                        file_paths.append(local_path)
+        image_paths, file_paths = await _extract_message_attachments(active_messages)
 
         all_attachment_paths = image_paths + file_paths
         if all_attachment_paths:
-            log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
+            log.info(
+                f"Extracted {len(image_paths)} media item(s) and "
+                f"{len(file_paths)} file(s) from request"
+            )
 
         # ── Send to provider ───────────────────────────────
         try:
@@ -1458,19 +1481,42 @@ def _responses_input_to_messages(
             if r == "developer":
                 r = "system"
             content = item.get("content", "")
-            # Content can be a list of content parts or a string
+            # Preserve media parts so direct multimodal providers can receive them.
             if isinstance(content, list):
-                # Extract text from content parts
-                text_parts = []
+                normalized_parts = []
                 for part in content:
                     if isinstance(part, dict):
                         if part.get("type") == "input_text":
-                            text_parts.append(part.get("text", ""))
+                            normalized_parts.append(
+                                {"type": "text", "text": part.get("text", "")}
+                            )
                         elif part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
+                            normalized_parts.append(part)
+                        elif part.get("type") == "input_image" and part.get("image_url"):
+                            image_url = part["image_url"]
+                            if isinstance(image_url, dict):
+                                image_url = image_url.get("url", "")
+                            normalized_parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_url},
+                                }
+                            )
+                        elif part.get("type") == "input_video" and part.get("video_url"):
+                            video_url = part["video_url"]
+                            if isinstance(video_url, dict):
+                                video_url = video_url.get("url", "")
+                            normalized_parts.append(
+                                {
+                                    "type": "video_url",
+                                    "video_url": {"url": video_url},
+                                }
+                            )
+                        elif part.get("type") in {"image_url", "video_url", "file"}:
+                            normalized_parts.append(part)
                     elif isinstance(part, str):
-                        text_parts.append(part)
-                content = "\n".join(text_parts) if text_parts else ""
+                        normalized_parts.append({"type": "text", "text": part})
+                content = normalized_parts
             messages.append(ChatMessage(role=r, content=content))
 
     return messages
@@ -1729,12 +1775,6 @@ async def create_response(
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
-    if Config.PROVIDER == "minimax" and _contains_attachment(request.input):
-        raise HTTPException(
-            status_code=501,
-            detail="Attachments are not supported by the MiniMax provider.",
-        )
-
     client = _get_client()
     model_id = _resolve_model_id(request.model)
     session_id = _extract_session_id(raw_request, getattr(request, "user", None))
@@ -1777,11 +1817,14 @@ async def create_response(
                 has_tool_prompt = True
 
         if is_persistent:
-            prompt, _ = _extract_persistent_prompt(
+            prompt, active_messages = _extract_persistent_prompt(
                 messages, is_first_turn, has_tool_prompt
             )
         else:
             prompt = _build_prompt(messages)
+            active_messages = messages
+
+        image_paths, file_paths = await _extract_message_attachments(active_messages)
 
         log.info(
             f"POST /v1/responses — model={model_id}, "
@@ -1793,6 +1836,8 @@ async def create_response(
         try:
             result = await client.send_message(
                 prompt,
+                image_paths=image_paths or None,
+                file_paths=file_paths or None,
                 model=model_id,
                 stateless=not is_persistent,
                 page=page,
